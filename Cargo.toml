@@ -1,6 +1,6 @@
 [package]
-name = "allsorts"
-version = "0.15.0"
+name = "allsorts-subset-browser"
+version = "0.16.0"
 authors = ["YesLogic Pty. Ltd. <info@yeslogic.com>"]
 edition = "2018"
 
@@ -12,7 +12,7 @@ readme = "README.md"
 license = "Apache-2.0"
 include = ["/LICENSE", "src/**/*"]
 
-description = "Font parser, shaping engine, and subsetter for OpenType, WOFF, and WOFF2"
+description = "Temp fork of allsorts 0.15 - includes patch for subsetting fonts for browsers"
 keywords = ["font", "shaping", "opentype", "truetype", "parse"]
 categories = ["text-processing"]
 
