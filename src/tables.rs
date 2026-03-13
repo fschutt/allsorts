@@ -4,6 +4,7 @@ pub mod aat;
 pub mod cmap;
 pub mod colr;
 pub mod cpal;
+pub mod gasp;
 pub mod glyf;
 pub mod kern;
 pub mod loca;
