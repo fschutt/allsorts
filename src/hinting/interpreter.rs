@@ -378,6 +378,8 @@ impl Interpreter {
 
         self.stack.clear();
         self.gs = GraphicsState::default();
+        // Note: storage is NOT cleared between prep runs.
+        // The prep program is responsible for setting all values it needs.
         self.instruction_count = 0;
         self.call_depth = 0;
         self.execute(prep)?;
@@ -981,8 +983,12 @@ impl Interpreter {
                 let idx = self.pop()? as u32;
                 let i = idx as usize;
                 if i >= self.cvt.len() {
-                    // Extend CVT if needed
                     self.cvt.resize(i + 1, 0);
+                }
+                if self.debug_trace_points && i < 8 {
+                    let old = self.cvt[i];
+                    eprintln!("[WCVTP] CVT[{i}]: {old} → {val} (ic={} depth={})",
+                        self.instruction_count, self.call_depth);
                 }
                 self.cvt[i] = val;
             }
@@ -1198,6 +1204,9 @@ impl Interpreter {
                 let i = idx as usize;
                 if i >= self.cvt.len() {
                     self.cvt.resize(i + 1, 0);
+                }
+                if self.debug_trace_points && i < 8 {
+                    eprintln!("[WCVTF] CVT[{i}]: {} → {scaled} (funits={val})", self.cvt[i]);
                 }
                 self.cvt[i] = scaled;
             }
@@ -2654,6 +2663,10 @@ impl Interpreter {
 
     fn op_deltac(&mut self, range: u8) -> Result<(), HintError> {
         let n = self.pop()? as u32;
+        if self.debug_trace_points && n > 0 {
+            eprintln!("[DELTAC{range}] n={n} pairs, stack top: {:?}",
+                &self.stack[self.stack.len().saturating_sub(6)..]);
+        }
         let delta_base = self.gs.delta_base as i32;
         let delta_shift = self.gs.delta_shift as i32;
 
@@ -2688,6 +2701,10 @@ impl Interpreter {
 
                 let i = cvt_idx as usize;
                 if i < self.cvt.len() {
+                    if self.debug_trace_points && i < 8 {
+                        eprintln!("[DELTAC{}] CVT[{i}]: {} → {} (delta={scaled}, ppem={target_ppem}, arg=0x{:02X}, delta_base={}, mag={})",
+                            range, self.cvt[i], self.cvt[i] + scaled, arg, delta_base, magnitude);
+                    }
                     self.cvt[i] += scaled;
                 }
             }
