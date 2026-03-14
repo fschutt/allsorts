@@ -247,10 +247,10 @@ pub struct Interpreter {
     /// When true, log move_point calls on glyph zone to stderr
     pub debug_trace_points: bool,
     /// When true, undo X-axis movements after glyph program (v40 mode).
-    /// This matches FreeType DEFAULT / Chrome / Core Text behavior where
-    /// only Y-axis hinting is applied and X positioning is left to the
-    /// subpixel/antialiasing renderer.
     pub subpixel_hinting: bool,
+    /// Snapshot of Y coordinates taken right after IUP[Y] runs.
+    /// Used in v40 mode to discard post-IUP Y modifications.
+    iup_y_snapshot: Option<Vec<i32>>,
 }
 
 impl Interpreter {
@@ -285,6 +285,7 @@ impl Interpreter {
             trace_mode: false,
             debug_trace_points: false,
             subpixel_hinting: true, // default: Y-only hinting (matches Chrome/FreeType v40)
+            iup_y_snapshot: None,
         }
     }
 
@@ -444,17 +445,30 @@ impl Interpreter {
 
         self.execute(instructions)?;
 
-        // v40 backward compatibility: undo X-axis movements.
-        // FreeType v40 (DEFAULT mode) and Chrome/Core Text on macOS only apply
-        // Y-axis hinting.  X-axis grid-fitting is suppressed because subpixel
-        // rendering handles X positioning.  We match this by resetting all
-        // glyph zone X coordinates to their original (scaled, unhinted) values
-        // after the glyph program finishes.
+        // v40 backward compatibility: undo X-axis movements AND post-IUP
+        // Y-axis modifications.
+        //
+        // FreeType v40 (DEFAULT mode) and Chrome/Core Text on macOS:
+        // - Suppress all X-axis grid-fitting (subpixel rendering handles X)
+        // - After IUP[Y], some glyph programs apply post-IUP function calls
+        //   that modify Y coordinates (e.g., Times New Roman 'o' at ppem=12
+        //   moves pt5.y from 150→77 via a called function). FreeType v40
+        //   suppresses these post-IUP modifications.
+        //
+        // We handle this by saving Y values right after IUP[Y] runs
+        // (stored in `iup_y_snapshot`) and restoring them after execution.
         if self.subpixel_hinting {
             let zone = &mut self.zones[1];
             for i in 0..zone.current.len() {
                 zone.current[i].x = zone.original[i].x;
+                // Restore Y from IUP snapshot if available
+                if let Some(snap) = &self.iup_y_snapshot {
+                    if i < snap.len() {
+                        zone.current[i].y = snap[i];
+                    }
+                }
             }
+            self.iup_y_snapshot = None;
         }
 
         Ok(())
@@ -812,6 +826,13 @@ impl Interpreter {
                 // IUP[a] - interpolate untouched points
                 let axis = opcode & 1; // 0 = y, 1 = x
                 self.op_iup(axis)?;
+                // In v40 mode, snapshot Y values right after IUP[Y] runs
+                // so post-IUP function calls can't modify them.
+                if axis == 0 && self.subpixel_hinting {
+                    self.iup_y_snapshot = Some(
+                        self.zones[1].current.iter().map(|p| p.y).collect()
+                    );
+                }
             }
             0x32..=0x33 => {
                 // SHP[a] - shift point
@@ -2287,12 +2308,19 @@ impl Interpreter {
             }
 
             let mut touched_points: Vec<usize> = Vec::new();
+            if self.debug_trace_points {
+                let axis_name = if axis == 1 { "X" } else { "Y" };
+                eprint!("[IUP {axis_name}] contour {contour_start}..={contour_end} touched: ");
+            }
             for i in contour_start..=contour_end {
                 if self.zones[1].flags[i].contains(touched_flag) {
                     touched_points.push(i);
                 }
             }
 
+            if self.debug_trace_points {
+                eprintln!("{:?}", touched_points);
+            }
             if !touched_points.is_empty() {
                 work.push((contour_start, contour_end, touched_points));
             }
@@ -2363,16 +2391,23 @@ impl Interpreter {
             }
 
             if self.zones[1].flags[i].contains(touched_flag) {
+                if self.debug_trace_points && i < 16 {
+                    let f = self.zones[1].flags[i];
+                    eprintln!("[IUP skip] pt={i} TOUCHED flags={f:?} axis={axis}");
+                }
                 continue;
             }
 
             // Use unscaled coordinates for interpolation (FreeType uses orus)
             let orus_i = get_coord(&self.zones[1].orus[i]);
+            let trace_this = self.debug_trace_points && i < 16;
 
             let new_coord = if t1_orus == t2_orus {
                 // Both reference points are at the same position: shift
                 let cur = get_coord(&self.zones[1].current[i]);
-                cur + delta1
+                let r = cur + delta1;
+                if trace_this { eprintln!("[IUP interp] pt={i} SAME orus, cur={cur} + delta1={delta1} = {r}"); }
+                r
             } else {
                 // Interpolate using unscaled coordinates for range/factor
                 let lo_orus = t1_orus.min(t2_orus);
@@ -2381,24 +2416,24 @@ impl Interpreter {
                 let hi_cur = if t1_orus < t2_orus { t2_cur } else { t1_cur };
                 let lo_delta = if t1_orus < t2_orus { delta1 } else { delta2 };
                 let hi_delta = if t1_orus < t2_orus { delta2 } else { delta1 };
-                let _lo_orig = get_coord(&self.zones[1].original[if t1_orus < t2_orus { t1_idx } else { t2_idx }]);
 
                 if orus_i <= lo_orus {
-                    // Below lower bound: shift by lower delta
                     let orig = get_coord(&self.zones[1].original[i]);
-                    orig + lo_delta
+                    let r = orig + lo_delta;
+                    if trace_this { eprintln!("[IUP interp] pt={i} BELOW lo={lo_orus}, orig={orig} + lo_delta={lo_delta} = {r}"); }
+                    r
                 } else if orus_i >= hi_orus {
-                    // Above upper bound: shift by upper delta
                     let orig = get_coord(&self.zones[1].original[i]);
-                    orig + hi_delta
+                    let r = orig + hi_delta;
+                    if trace_this { eprintln!("[IUP interp] pt={i} ABOVE hi={hi_orus}, orig={orig} + hi_delta={hi_delta} = {r}"); }
+                    r
                 } else {
-                    // Between: linear interpolation using FreeType's approach
-                    // scale = FT_DivFix(cur2 - cur1, orus2 - orus1)
-                    // result = cur1 + FT_MulFix(orus_i - orus1, scale)
                     let range = (hi_orus - lo_orus) as i64;
                     let factor = (orus_i - lo_orus) as i64;
                     let scale = ft_divfix((hi_cur - lo_cur) as i64, range);
-                    lo_cur + ft_mulfix(factor, scale) as i32
+                    let r = lo_cur + ft_mulfix(factor, scale) as i32;
+                    if trace_this { eprintln!("[IUP interp] pt={i} BETWEEN lo={lo_orus} hi={hi_orus} orus={orus_i} lo_cur={lo_cur} hi_cur={hi_cur} range={range} factor={factor} scale={scale} result={r}"); }
+                    r
                 }
             };
 
