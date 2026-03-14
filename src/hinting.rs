@@ -202,6 +202,11 @@ impl HintInstance {
     ///
     /// `raw_points_funits` provides the original font-unit coordinates (before scaling).
     /// FreeType uses these for IUP interpolation factors, avoiding F26Dot6 rounding errors.
+    ///
+    /// `vert_origin_f26dot6` and `vert_advance_f26dot6` set the Y coordinates of
+    /// phantom points 2 (top) and 3 (bottom).  FreeType computes these from vertical
+    /// metrics: phantom[2].y = vertBearingY, phantom[3].y = vertBearingY - height.
+    /// Pass `None` to use (0, 0) as before.
     pub fn hint_glyph_with_orus(
         &mut self,
         points_f26dot6: &[(i32, i32)],
@@ -211,20 +216,44 @@ impl HintInstance {
         instructions: &[u8],
         advance_width_f26dot6: i32,
     ) -> Result<Vec<(i32, i32)>, HintError> {
+        self.hint_glyph_full(
+            points_f26dot6, raw_points_funits, on_curve, contour_ends,
+            instructions, advance_width_f26dot6, None, None,
+        )
+    }
+
+    /// Full hinting with vertical phantom point support.
+    ///
+    /// `phantom_top_y` and `phantom_bottom_y` are F26Dot6 Y coordinates for
+    /// phantom points 2 and 3, computed from vertical metrics.
+    pub fn hint_glyph_full(
+        &mut self,
+        points_f26dot6: &[(i32, i32)],
+        raw_points_funits: Option<&[(i16, i16)]>,
+        on_curve: &[bool],
+        contour_ends: &[u16],
+        instructions: &[u8],
+        advance_width_f26dot6: i32,
+        phantom_top_y: Option<i32>,
+        phantom_bottom_y: Option<i32>,
+    ) -> Result<Vec<(i32, i32)>, HintError> {
         if instructions.is_empty() || !self.fpgm_executed {
             return Ok(points_f26dot6.to_vec());
         }
 
         let real_count = points_f26dot6.len();
 
+        let top_y = phantom_top_y.unwrap_or(0);
+        let bottom_y = phantom_bottom_y.unwrap_or(0);
+
         let mut points: Vec<Point> = points_f26dot6
             .iter()
             .map(|&(x, y)| Point { x, y })
             .collect();
-        points.push(Point { x: 0, y: 0 });
-        points.push(Point { x: advance_width_f26dot6, y: 0 });
-        points.push(Point { x: 0, y: 0 });
-        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: 0, y: 0 });                   // phantom[0]: origin
+        points.push(Point { x: advance_width_f26dot6, y: 0 }); // phantom[1]: advance
+        points.push(Point { x: 0, y: top_y });                // phantom[2]: top
+        points.push(Point { x: 0, y: bottom_y });             // phantom[3]: bottom
 
         let mut on_curve_ext: Vec<bool> = on_curve.to_vec();
         on_curve_ext.extend_from_slice(&[true, true, true, true]);
