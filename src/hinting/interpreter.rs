@@ -1800,22 +1800,14 @@ impl Interpreter {
 
         if respect_min_dist {
             let min_dist = self.gs.minimum_distance.to_bits();
-            // Use orig_dist sign (measured distance before any adjustments)
-            // to determine direction when dist rounds to zero.
-            if dist >= 0 && orig_dist >= 0 {
+            if dist >= 0 {
                 if dist < min_dist {
-                    dist = min_dist;
+                    // When dist rounds to zero from a negative original distance,
+                    // apply minimum in the ORIGINAL direction to avoid sign flip.
+                    dist = if dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
                 }
-            } else if dist <= 0 && orig_dist < 0 {
-                if dist > -min_dist {
-                    dist = -min_dist;
-                }
-            } else if dist >= 0 && orig_dist < 0 {
-                // Rounding crossed zero: use original direction
+            } else if dist > -min_dist {
                 dist = -min_dist;
-            } else {
-                // dist < 0 && orig_dist >= 0: rounding crossed zero other way
-                dist = min_dist;
             }
         }
 
@@ -1918,13 +1910,11 @@ impl Interpreter {
         if respect_min_dist {
             let min_dist = self.gs.minimum_distance.to_bits();
             let before_min = dist;
-            // Use orig_dist sign to determine direction when dist rounds to zero.
-            // Without this, rounding a small negative distance to 0 would apply
-            // +minimum_distance instead of -minimum_distance, pushing the point
-            // in the WRONG direction (e.g., right instead of left).
-            if orig_dist >= 0 {
+            if dist >= 0 {
                 if dist < min_dist {
-                    dist = min_dist;
+                    // When dist rounds to zero from a negative original distance,
+                    // apply minimum in the ORIGINAL direction to avoid sign flip.
+                    dist = if dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
                 }
             } else if dist > -min_dist {
                 dist = -min_dist;
@@ -2139,10 +2129,14 @@ impl Interpreter {
             self.zones[zp2].ensure_capacity(i + 1);
             // Move directly along freedom vector (no projection)
             // Use ft_muldiv for correct signed rounding (FreeType's TT_MulFix14)
-            self.zones[zp2].current[i].x +=
-                ft_muldiv(dist as i64, fx.to_bits() as i64, 0x4000) as i32;
-            self.zones[zp2].current[i].y +=
-                ft_muldiv(dist as i64, fy.to_bits() as i64, 0x4000) as i32;
+            let dx = ft_muldiv(dist as i64, fx.to_bits() as i64, 0x4000) as i32;
+            let dy = ft_muldiv(dist as i64, fy.to_bits() as i64, 0x4000) as i32;
+            if self.debug_trace_points && zp2 == 1 {
+                eprintln!("[SHPIX] pt={p} dist={dist} dx={dx} dy={dy} fv=({},{})",
+                    fx.to_bits(), fy.to_bits());
+            }
+            self.zones[zp2].current[i].x += dx;
+            self.zones[zp2].current[i].y += dy;
 
             if fx.to_bits() != 0 {
                 self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_X);
