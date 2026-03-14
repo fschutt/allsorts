@@ -246,6 +246,11 @@ pub struct Interpreter {
     pub trace_mode: bool,
     /// When true, log move_point calls on glyph zone to stderr
     pub debug_trace_points: bool,
+    /// When true, undo X-axis movements after glyph program (v40 mode).
+    /// This matches FreeType DEFAULT / Chrome / Core Text behavior where
+    /// only Y-axis hinting is applied and X positioning is left to the
+    /// subpixel/antialiasing renderer.
+    pub subpixel_hinting: bool,
 }
 
 impl Interpreter {
@@ -279,6 +284,7 @@ impl Interpreter {
             call_depth: 0,
             trace_mode: false,
             debug_trace_points: false,
+            subpixel_hinting: true, // default: Y-only hinting (matches Chrome/FreeType v40)
         }
     }
 
@@ -436,7 +442,22 @@ impl Interpreter {
         self.instruction_count = 0;
         self.call_depth = 0;
 
-        self.execute(instructions)
+        self.execute(instructions)?;
+
+        // v40 backward compatibility: undo X-axis movements.
+        // FreeType v40 (DEFAULT mode) and Chrome/Core Text on macOS only apply
+        // Y-axis hinting.  X-axis grid-fitting is suppressed because subpixel
+        // rendering handles X positioning.  We match this by resetting all
+        // glyph zone X coordinates to their original (scaled, unhinted) values
+        // after the glyph program finishes.
+        if self.subpixel_hinting {
+            let zone = &mut self.zones[1];
+            for i in 0..zone.current.len() {
+                zone.current[i].x = zone.original[i].x;
+            }
+        }
+
+        Ok(())
     }
 
     // ── Core execution loop ──────────────────────────────────────────
