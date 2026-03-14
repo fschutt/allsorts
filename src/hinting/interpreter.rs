@@ -246,10 +246,30 @@ pub struct Interpreter {
     pub trace_mode: bool,
     /// When true, log move_point calls on glyph zone to stderr
     pub debug_trace_points: bool,
-    /// When true, undo X-axis movements after glyph program (v40 mode).
-    pub subpixel_hinting: bool,
+
+    // ── Hinting mode flags (toggle to find correct behavior) ────────
+
+    /// Flag A: Reset X coordinates to original after glyph program.
+    /// Matches FreeType v40 / Chrome which only applies Y-axis hinting.
+    /// Without this: full X+Y hinting (v35 mode), causes SHPIX spacing issues.
+    /// With this: Y-only hinting, but curves that depend on X/Y coordination
+    /// (e.g., 'u' bottom curve at ppem=20) may distort.
+    pub suppress_x_axis: bool,
+
+    /// Flag B: Snapshot Y after IUP[Y], discard post-IUP Y modifications.
+    /// Some glyph programs modify Y after IUP via function calls (e.g.,
+    /// 'o' at ppem=12: pt5 moves from 150→77). FreeType v40 may suppress these.
+    /// Without this: post-IUP moves apply, causing diamond shapes at small ppem.
+    /// With this: clean IUP interpolation preserved, but some legitimate
+    /// post-IUP adjustments are also discarded.
+    pub snapshot_iup_y: bool,
+
+    /// Flag C: Use orig_dist sign for minimum_distance when dist rounds to zero.
+    /// Without this: small negative distances get +min_dist (wrong direction).
+    /// With this: preserves original direction, matching FreeType behavior.
+    pub fix_min_distance_sign: bool,
+
     /// Snapshot of Y coordinates taken right after IUP[Y] runs.
-    /// Used in v40 mode to discard post-IUP Y modifications.
     iup_y_snapshot: Option<Vec<i32>>,
 }
 
@@ -284,7 +304,9 @@ impl Interpreter {
             call_depth: 0,
             trace_mode: false,
             debug_trace_points: false,
-            subpixel_hinting: true, // Y-only hinting (matches Chrome/FreeType v40)
+            suppress_x_axis: false,    // Flag A: OFF — full X+Y hinting
+            snapshot_iup_y: false,    // Flag B: OFF
+            fix_min_distance_sign: true, // Flag C: preserve direction on zero-round
             iup_y_snapshot: None,
         }
     }
@@ -307,6 +329,11 @@ impl Interpreter {
     /// Returns the storage area size.
     pub fn storage_len(&self) -> usize {
         self.storage.len()
+    }
+
+    /// Read a storage area value (for debugging).
+    pub fn read_storage(&self, idx: usize) -> Option<i32> {
+        self.storage.get(idx).copied()
     }
 
     /// Returns the number of function definitions.
@@ -457,15 +484,20 @@ impl Interpreter {
         //
         // We handle this by saving Y values right after IUP[Y] runs
         // (stored in `iup_y_snapshot`) and restoring them after execution.
-        if self.subpixel_hinting {
+        // Flag A: suppress X-axis movements
+        if self.suppress_x_axis {
             let zone = &mut self.zones[1];
             for i in 0..zone.current.len() {
                 zone.current[i].x = zone.original[i].x;
-                // Restore Y from IUP snapshot if available
-                if let Some(snap) = &self.iup_y_snapshot {
-                    if i < snap.len() {
-                        zone.current[i].y = snap[i];
-                    }
+            }
+        }
+
+        // Flag B: restore Y from IUP snapshot (discard post-IUP Y mods)
+        if self.snapshot_iup_y {
+            if let Some(snap) = &self.iup_y_snapshot {
+                let zone = &mut self.zones[1];
+                for i in 0..zone.current.len().min(snap.len()) {
+                    zone.current[i].y = snap[i];
                 }
             }
             self.iup_y_snapshot = None;
@@ -828,7 +860,7 @@ impl Interpreter {
                 self.op_iup(axis)?;
                 // In v40 mode, snapshot Y values right after IUP[Y] runs
                 // so post-IUP function calls can't modify them.
-                if axis == 0 && self.subpixel_hinting {
+                if axis == 0 && self.snapshot_iup_y {
                     self.iup_y_snapshot = Some(
                         self.zones[1].current.iter().map(|p| p.y).collect()
                     );
@@ -1846,7 +1878,7 @@ impl Interpreter {
                 if dist < min_dist {
                     // When dist rounds to zero from a negative original distance,
                     // apply minimum in the ORIGINAL direction to avoid sign flip.
-                    dist = if dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
+                    dist = if self.fix_min_distance_sign && dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
                 }
             } else if dist > -min_dist {
                 dist = -min_dist;
@@ -1956,7 +1988,7 @@ impl Interpreter {
                 if dist < min_dist {
                     // When dist rounds to zero from a negative original distance,
                     // apply minimum in the ORIGINAL direction to avoid sign flip.
-                    dist = if dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
+                    dist = if self.fix_min_distance_sign && dist == 0 && orig_dist < 0 { -min_dist } else { min_dist };
                 }
             } else if dist > -min_dist {
                 dist = -min_dist;
