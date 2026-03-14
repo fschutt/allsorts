@@ -536,16 +536,6 @@ impl Interpreter {
             let opcode = bytecode[ip];
             ip += 1;
 
-            if self.trace_mode {
-                use std::io::Write;
-                let stack_top: Vec<i32> = self.stack.iter().rev().take(5).copied().collect();
-                let _ = writeln!(std::io::stderr(),
-                    "[HINT] ic={} ip={} op=0x{:02X} depth={} stack={:?} rp0={} rp1={} rp2={}",
-                    self.instruction_count, ip-1, opcode, self.call_depth,
-                    stack_top,
-                    self.gs.rp0, self.gs.rp1, self.gs.rp2);
-                let _ = std::io::stderr().flush();
-            }
             self.dispatch(opcode, bytecode, &mut ip)?;
         }
         Ok(())
@@ -831,9 +821,6 @@ impl Interpreter {
             0x2B => {
                 // CALL
                 let fn_id = self.pop()? as u32;
-                if self.debug_trace_points {
-                    eprintln!("[CALL] fn={fn_id} stack_depth={} ip={}", self.stack.len(), *ip - 1);
-                }
                 if self.call_depth >= MAX_CALL_DEPTH {
                     return Err(HintError::CallStackOverflow);
                 }
@@ -1003,11 +990,6 @@ impl Interpreter {
                 if i >= self.cvt.len() {
                     self.cvt.resize(i + 1, 0);
                 }
-                if self.debug_trace_points && i < 8 {
-                    let old = self.cvt[i];
-                    eprintln!("[WCVTP] CVT[{i}]: {old} → {val} (ic={} depth={})",
-                        self.instruction_count, self.call_depth);
-                }
                 self.cvt[i] = val;
             }
             0x45 => {
@@ -1142,9 +1124,6 @@ impl Interpreter {
             0x5E => {
                 // SDB - set delta base
                 let new_base = self.pop()? as u16;
-                if self.debug_trace_points {
-                    eprintln!("[SDB] delta_base: {} → {}", self.gs.delta_base, new_base);
-                }
                 self.gs.delta_base = new_base;
             }
             0x5F => {
@@ -1226,9 +1205,6 @@ impl Interpreter {
                 let i = idx as usize;
                 if i >= self.cvt.len() {
                     self.cvt.resize(i + 1, 0);
-                }
-                if self.debug_trace_points && i < 8 {
-                    eprintln!("[WCVTF] CVT[{i}]: {} → {scaled} (funits={val})", self.cvt[i]);
                 }
                 self.cvt[i] = scaled;
             }
@@ -1628,15 +1604,6 @@ impl Interpreter {
 
     /// Move a point along the freedom vector by a given F26Dot6 distance.
     fn move_point(&mut self, zone: usize, point: usize, distance: i32) {
-        // Debug tracing for specific points (set via debug_trace_points)
-        if self.debug_trace_points && zone == 1 {
-            let (fx, fy) = self.gs.freedom_vector;
-            let (px, py) = self.gs.projection_vector;
-            let cur = self.zones.get(zone).and_then(|z| z.current.get(point)).copied();
-            eprintln!("[move_point] zone={zone} pt={point} dist={distance} fv=({},{}) pv=({},{}) cur={:?}",
-                fx.to_bits(), fy.to_bits(), px.to_bits(), py.to_bits(), cur);
-        }
-
         // Dynamically grow zone if needed, with cap to prevent OOM
         if point >= self.zones[zone].current.len() {
             if point > 10_000 {
@@ -1797,15 +1764,8 @@ impl Interpreter {
 
         let distance = if round {
             let rounded = self.gs.round(F26Dot6::from_bits(cur_dist));
-            if self.debug_trace_points && zp0 == 1 {
-                eprintln!("[MDAP R] pt={p} cur_dist={cur_dist} rounded={} dist={}",
-                    rounded.to_bits(), rounded.to_bits() - cur_dist);
-            }
             rounded.to_bits() - cur_dist
         } else {
-            if self.debug_trace_points && zp0 == 1 {
-                eprintln!("[MDAP noR] pt={p} cur_dist={cur_dist}");
-            }
             0
         };
 
@@ -1860,10 +1820,6 @@ impl Interpreter {
                 cur_dist
             };
             let rounded = self.gs.round(F26Dot6::from_bits(target));
-            if self.debug_trace_points && zp0 == 1 {
-                eprintln!("[MIAP R] pt={p} cvt_idx={cvt_idx} cvt_val={cvt_val} cur={cur_dist} diff={diff} cut_in={} target={target} rounded={}",
-                    self.gs.control_value_cut_in.to_bits(), rounded.to_bits());
-            }
             rounded.to_bits() - cur_dist
         } else {
             cvt_val - cur_dist
@@ -2013,17 +1969,11 @@ impl Interpreter {
         }
 
         if do_round {
-            let before_round = dist;
             dist = self.gs.round(F26Dot6::from_bits(dist)).to_bits();
-            if self.debug_trace_points && zp1 == 1 {
-                eprintln!("[MIRP] pt={p} cvt_idx={cvt_idx} cvt_val={cvt_val} orig_dist={orig_dist} after_autoflip={} before_round={before_round} after_round={dist}",
-                    if self.gs.auto_flip && (orig_dist >= 0) != (cvt_val >= 0) { -cvt_val } else { cvt_val });
-            }
         }
 
         if respect_min_dist {
             let min_dist = self.gs.minimum_distance.to_bits();
-            let before_min = dist;
             if dist >= 0 {
                 if dist < min_dist {
                     // When dist rounds to zero from a negative original distance,
@@ -2032,9 +1982,6 @@ impl Interpreter {
                 }
             } else if dist > -min_dist {
                 dist = -min_dist;
-            }
-            if self.debug_trace_points && zp1 == 1 && before_min != dist {
-                eprintln!("[MIRP] pt={p} min_dist applied: {before_min} -> {dist} (orig_dist={orig_dist})");
             }
         }
 
@@ -2245,10 +2192,6 @@ impl Interpreter {
             // Use ft_muldiv for correct signed rounding (FreeType's TT_MulFix14)
             let dx = ft_muldiv(dist as i64, fx.to_bits() as i64, 0x4000) as i32;
             let dy = ft_muldiv(dist as i64, fy.to_bits() as i64, 0x4000) as i32;
-            if self.debug_trace_points && zp2 == 1 {
-                eprintln!("[SHPIX] pt={p} dist={dist} dx={dx} dy={dy} fv=({},{})",
-                    fx.to_bits(), fy.to_bits());
-            }
             self.zones[zp2].current[i].x += dx;
             self.zones[zp2].current[i].y += dy;
 
@@ -2293,11 +2236,6 @@ impl Interpreter {
             y: rp2_cur.y - rp1_cur.y,
         });
 
-        if self.debug_trace_points {
-            eprintln!("[IP] rp1={} rp2={} rp1_orig={:?} rp2_orig={:?} rp1_cur={:?} rp2_cur={:?} orig_range={} cur_range={}",
-                self.gs.rp1, self.gs.rp2, rp1_orig, rp2_orig, rp1_cur, rp2_cur, orig_range, cur_range);
-        }
-
         for _ in 0..loop_count {
             let p = self.pop()? as u32;
             let p_orig = self.get_original_point(zp2, p)?;
@@ -2318,11 +2256,6 @@ impl Interpreter {
                 x: p_cur.x - rp1_cur.x,
                 y: p_cur.y - rp1_cur.y,
             });
-
-            if self.debug_trace_points {
-                eprintln!("[IP]   pt={p} orig_dist={orig_dist} new_dist={new_dist} cur_dist={cur_dist} move={}",
-                    new_dist - cur_dist);
-            }
 
             self.move_point(zp2, p as usize, new_dist - cur_dist);
         }
@@ -2352,21 +2285,6 @@ impl Interpreter {
             PointFlags::TOUCHED_Y
         };
 
-        if self.debug_trace_points {
-            let axis_name = if axis == 1 { "X" } else { "Y" };
-            eprintln!("[IUP {axis_name}] n_points={n_points}");
-            for i in 0..n_points.min(60) {
-                let f = self.zones[1].flags[i];
-                if f.contains(touched_flag) {
-                    let c = self.zones[1].current[i];
-                    let o = self.zones[1].original[i];
-                    let coord = if axis == 1 { c.x } else { c.y };
-                    let orig_coord = if axis == 1 { o.x } else { o.y };
-                    eprintln!("  touched[{i}] cur={coord} orig={orig_coord} delta={}", coord - orig_coord);
-                }
-            }
-        }
-
         // Collect all (contour_start, contour_end, touched_points) first
         // to avoid borrowing self.zones[1] while calling self.iup_interp.
         let mut work: Vec<(usize, usize, Vec<usize>)> = Vec::new();
@@ -2380,19 +2298,12 @@ impl Interpreter {
             }
 
             let mut touched_points: Vec<usize> = Vec::new();
-            if self.debug_trace_points {
-                let axis_name = if axis == 1 { "X" } else { "Y" };
-                eprint!("[IUP {axis_name}] contour {contour_start}..={contour_end} touched: ");
-            }
             for i in contour_start..=contour_end {
                 if self.zones[1].flags[i].contains(touched_flag) {
                     touched_points.push(i);
                 }
             }
 
-            if self.debug_trace_points {
-                eprintln!("{:?}", touched_points);
-            }
             if !touched_points.is_empty() {
                 work.push((contour_start, contour_end, touched_points));
             }
@@ -2463,23 +2374,16 @@ impl Interpreter {
             }
 
             if self.zones[1].flags[i].contains(touched_flag) {
-                if self.debug_trace_points && i < 16 {
-                    let f = self.zones[1].flags[i];
-                    eprintln!("[IUP skip] pt={i} TOUCHED flags={f:?} axis={axis}");
-                }
                 continue;
             }
 
             // Use unscaled coordinates for interpolation (FreeType uses orus)
             let orus_i = get_coord(&self.zones[1].orus[i]);
-            let trace_this = self.debug_trace_points && i < 16;
 
             let new_coord = if t1_orus == t2_orus {
                 // Both reference points are at the same position: shift
                 let cur = get_coord(&self.zones[1].current[i]);
-                let r = cur + delta1;
-                if trace_this { eprintln!("[IUP interp] pt={i} SAME orus, cur={cur} + delta1={delta1} = {r}"); }
-                r
+                cur + delta1
             } else {
                 // Interpolate using unscaled coordinates for range/factor
                 let lo_orus = t1_orus.min(t2_orus);
@@ -2491,21 +2395,15 @@ impl Interpreter {
 
                 if orus_i <= lo_orus {
                     let orig = get_coord(&self.zones[1].original[i]);
-                    let r = orig + lo_delta;
-                    if trace_this { eprintln!("[IUP interp] pt={i} BELOW lo={lo_orus}, orig={orig} + lo_delta={lo_delta} = {r}"); }
-                    r
+                    orig + lo_delta
                 } else if orus_i >= hi_orus {
                     let orig = get_coord(&self.zones[1].original[i]);
-                    let r = orig + hi_delta;
-                    if trace_this { eprintln!("[IUP interp] pt={i} ABOVE hi={hi_orus}, orig={orig} + hi_delta={hi_delta} = {r}"); }
-                    r
+                    orig + hi_delta
                 } else {
                     let range = (hi_orus - lo_orus) as i64;
                     let factor = (orus_i - lo_orus) as i64;
                     let scale = ft_divfix((hi_cur - lo_cur) as i64, range);
-                    let r = lo_cur + ft_mulfix(factor, scale) as i32;
-                    if trace_this { eprintln!("[IUP interp] pt={i} BETWEEN lo={lo_orus} hi={hi_orus} orus={orus_i} lo_cur={lo_cur} hi_cur={hi_cur} range={range} factor={factor} scale={scale} result={r}"); }
-                    r
+                    lo_cur + ft_mulfix(factor, scale) as i32
                 }
             };
 
@@ -2689,21 +2587,6 @@ impl Interpreter {
 
     fn op_deltac(&mut self, range: u8) -> Result<(), HintError> {
         let n = self.pop()? as u32;
-        // n is already popped. The stack now has n pairs of (arg, cvt_idx).
-        // DELTAC args are byte values (0-255). Values >255 indicate stack misalignment.
-        if self.debug_trace_points && n > 0 {
-            let pair_count = n as usize;
-            let stack_len = self.stack.len();
-            if stack_len >= pair_count * 2 {
-                for pi in 0..pair_count {
-                    let arg = self.stack[stack_len - 1 - pi * 2];
-                    if arg > 255 || arg < 0 {
-                        let cvt = self.stack[stack_len - 2 - pi * 2];
-                        eprintln!("[DELTAC{range}] STACK MISALIGNMENT: pair {pi}: arg={arg} (>255!) cvt_idx={cvt} at ppem={}", self.ppem);
-                    }
-                }
-            }
-        }
         let delta_base = self.gs.delta_base as i32;
         let delta_shift = self.gs.delta_shift as i32;
 
@@ -2739,11 +2622,6 @@ impl Interpreter {
 
                 let i = cvt_idx as usize;
                 if i < self.cvt.len() {
-                    if self.debug_trace_points && i < 8 {
-                        let base = if i < self.cvt_original.len() { self.cvt_original[i] } else { self.cvt[i] };
-                        eprintln!("[DELTAC{}] CVT[{i}]: orig={base} → {} (delta={scaled}, ppem={target_ppem})",
-                            range, base + scaled);
-                    }
                     self.cvt[i] += scaled;
                 }
             }
