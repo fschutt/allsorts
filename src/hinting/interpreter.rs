@@ -56,6 +56,57 @@ impl fmt::Display for HintError {
 
 impl std::error::Error for HintError {}
 
+// ── FreeType-compatible signed multiply-divide ──────────────────────
+//
+// Matches FreeType's `FT_MulDiv`: compute `a * b / c` with correct
+// rounding for any sign combination.  The trick is to take absolute
+// values, add a half-divisor for rounding, divide, then reapply sign.
+
+#[inline]
+fn ft_muldiv(a: i64, b: i64, c: i64) -> i64 {
+    if c == 0 {
+        return 0;
+    }
+    let mut s: i64 = 1;
+    let mut aa = a;
+    let mut bb = b;
+    let mut cc = c;
+    if aa < 0 { aa = -aa; s = -s; }
+    if bb < 0 { bb = -bb; s = -s; }
+    if cc < 0 { cc = -cc; s = -s; }
+    let d = (aa * bb + (cc >> 1)) / cc;
+    if s > 0 { d } else { -d }
+}
+
+/// FreeType's FT_DivFix: compute `(a << 16) / b` with signed rounding.
+/// Returns a 16.16 fixed-point scale factor.
+#[inline]
+fn ft_divfix(a: i64, b: i64) -> i64 {
+    if b == 0 {
+        return 0x7FFFFFFF;
+    }
+    let mut s: i64 = 1;
+    let mut aa = a;
+    let mut bb = b;
+    if aa < 0 { aa = -aa; s = -s; }
+    if bb < 0 { bb = -bb; s = -s; }
+    let q = ((aa << 16) + (bb >> 1)) / bb;
+    if s > 0 { q } else { -q }
+}
+
+/// FreeType's FT_MulFix: compute `(a * b + 0x8000) >> 16` with signed rounding.
+/// Multiplies a value by a 16.16 fixed-point factor.
+#[inline]
+fn ft_mulfix(a: i64, b: i64) -> i64 {
+    let mut s: i64 = 1;
+    let mut aa = a;
+    let mut bb = b;
+    if aa < 0 { aa = -aa; s = -s; }
+    if bb < 0 { bb = -bb; s = -s; }
+    let c = (aa * bb + 0x8000) >> 16;
+    if s > 0 { c } else { -c }
+}
+
 // ── Point / Zone types ───────────────────────────────────────────────
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -77,6 +128,10 @@ bitflags::bitflags! {
 pub struct Zone {
     pub original: Vec<Point>,
     pub current: Vec<Point>,
+    /// Unscaled original coordinates in font units (FreeType's "orus").
+    /// Used by IUP for more precise interpolation — integer font-unit
+    /// coordinates avoid the rounding errors present in scaled F26Dot6.
+    pub orus: Vec<Point>,
     pub flags: Vec<PointFlags>,
     pub contour_ends: Vec<u16>,
 }
@@ -86,6 +141,7 @@ impl Zone {
         Zone {
             original: vec![Point::default(); n_points],
             current: vec![Point::default(); n_points],
+            orus: vec![Point::default(); n_points],
             flags: vec![PointFlags::empty(); n_points],
             contour_ends: Vec::new(),
         }
@@ -98,7 +154,16 @@ impl Zone {
     pub fn resize(&mut self, n: usize) {
         self.original.resize(n, Point::default());
         self.current.resize(n, Point::default());
+        self.orus.resize(n, Point::default());
         self.flags.resize(n, PointFlags::empty());
+    }
+
+    /// Ensure the zone can hold at least `n` points, growing if necessary.
+    #[inline]
+    pub fn ensure_capacity(&mut self, n: usize) {
+        if n > self.current.len() && n <= 10_000 {
+            self.resize(n);
+        }
     }
 }
 
@@ -148,6 +213,11 @@ pub struct Interpreter {
     // Execution state
     instruction_count: u64,
     call_depth: u32,
+
+    /// When true, dump every instruction to stderr (for debugging)
+    pub trace_mode: bool,
+    /// When true, log move_point calls on glyph zone to stderr
+    pub debug_trace_points: bool,
 }
 
 impl Interpreter {
@@ -179,7 +249,49 @@ impl Interpreter {
             scale: 0,
             instruction_count: 0,
             call_depth: 0,
+            trace_mode: false,
+            debug_trace_points: false,
         }
+    }
+
+    /// Returns the current CVT values (F26Dot6 stored as i32).
+    pub fn cvt(&self) -> &[i32] {
+        &self.cvt
+    }
+
+    /// Returns the max stack size.
+    pub fn max_stack(&self) -> usize {
+        self.max_stack
+    }
+
+    /// Returns the storage area size.
+    pub fn storage_len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Returns the number of function definitions.
+    pub fn fdef_count(&self) -> usize {
+        self.fdefs.len()
+    }
+
+    /// Returns the number of twilight zone points.
+    pub fn twilight_point_count(&self) -> usize {
+        self.zones[0].original.len()
+    }
+
+    /// Returns the ppem value.
+    pub fn ppem(&self) -> u16 {
+        self.ppem
+    }
+
+    /// Returns the scale value (16.16 fixed-point).
+    pub fn scale(&self) -> i64 {
+        self.scale
+    }
+
+    /// Returns units_per_em.
+    pub fn units_per_em(&self) -> u16 {
+        self.units_per_em
     }
 
     /// Execute the font program (`fpgm`) to populate function definitions.
@@ -234,6 +346,23 @@ impl Interpreter {
         contour_ends: &[u16],
         instructions: &[u8],
     ) -> Result<(), HintError> {
+        // Set up the glyph zone with empty orus (no unscaled data)
+        self.hint_glyph_with_orus(points, None, on_curve, contour_ends, instructions)
+    }
+
+    /// Hint a glyph with optional unscaled original coordinates (orus).
+    ///
+    /// If `orus` is provided, IUP interpolation uses these exact integer
+    /// coordinates instead of the scaled F26Dot6 `points`. This matches
+    /// FreeType's approach and avoids ±1 F26Dot6 rounding errors in IUP.
+    pub fn hint_glyph_with_orus(
+        &mut self,
+        points: &[Point],
+        orus: Option<&[Point]>,
+        on_curve: &[bool],
+        contour_ends: &[u16],
+        instructions: &[u8],
+    ) -> Result<(), HintError> {
         // Set up the glyph zone
         let n = points.len();
         let zone = &mut self.zones[1];
@@ -241,6 +370,12 @@ impl Interpreter {
         for i in 0..n {
             zone.original[i] = points[i];
             zone.current[i] = points[i];
+            // Store unscaled coordinates if provided, otherwise use scaled
+            zone.orus[i] = if let Some(orus) = orus {
+                orus.get(i).copied().unwrap_or(points[i])
+            } else {
+                points[i]
+            };
             let mut flags = PointFlags::empty();
             if on_curve.get(i).copied().unwrap_or(false) {
                 flags |= PointFlags::ON_CURVE;
@@ -249,8 +384,13 @@ impl Interpreter {
         }
         zone.contour_ends = contour_ends.to_vec();
 
-        // Reset graphics state to defaults (set by prep)
+        // Reset graphics state to defaults (set by prep), then override
+        // per TrueType spec: projection/freedom vectors reset to x-axis,
+        // reference points to 0, loop to 1, zone pointers to 1.
         self.gs = self.default_gs.clone();
+        self.gs.projection_vector = (F2Dot14::ONE, F2Dot14::ZERO);
+        self.gs.freedom_vector = (F2Dot14::ONE, F2Dot14::ZERO);
+        self.gs.dual_projection_vector = (F2Dot14::ONE, F2Dot14::ZERO);
         self.gs.rp0 = 0;
         self.gs.rp1 = 0;
         self.gs.rp2 = 0;
@@ -279,6 +419,16 @@ impl Interpreter {
             let opcode = bytecode[ip];
             ip += 1;
 
+            if self.trace_mode {
+                use std::io::Write;
+                let stack_top: Vec<i32> = self.stack.iter().rev().take(5).copied().collect();
+                let _ = writeln!(std::io::stderr(),
+                    "[HINT] ic={} ip={} op=0x{:02X} depth={} stack={:?} rp0={} rp1={} rp2={}",
+                    self.instruction_count, ip-1, opcode, self.call_depth,
+                    stack_top,
+                    self.gs.rp0, self.gs.rp1, self.gs.rp2);
+                let _ = std::io::stderr().flush();
+            }
             self.dispatch(opcode, bytecode, &mut ip)?;
         }
         Ok(())
@@ -442,7 +592,9 @@ impl Interpreter {
             0x1C => {
                 // JMPR - jump relative
                 let offset = self.pop()?;
-                let new_ip = (*ip as i64) + (offset as i64) - 1;
+                // offset is relative to the JMPR opcode position (*ip - 1)
+                let opcode_pos = *ip as i64 - 1;
+                let new_ip = opcode_pos + offset as i64;
                 if new_ip < 0 || new_ip > bytecode.len() as i64 {
                     return Err(HintError::InvalidJump);
                 }
@@ -543,6 +695,9 @@ impl Interpreter {
                 if self.call_depth >= MAX_CALL_DEPTH {
                     return Err(HintError::CallStackOverflow);
                 }
+                if count > 10000 {
+                    return Err(HintError::ExceededMaxInstructions);
+                }
                 let func = self
                     .fdefs
                     .get(fn_id as usize)
@@ -606,17 +761,20 @@ impl Interpreter {
             }
             0x32..=0x33 => {
                 // SHP[a] - shift point
-                let use_rp1 = opcode & 1 == 0;
+                // SHP[0] (0x32) uses rp2/zp1, SHP[1] (0x33) uses rp1/zp0
+                let use_rp1 = opcode & 1 != 0;
                 self.op_shp(use_rp1)?;
             }
             0x34..=0x35 => {
                 // SHC[a] - shift contour
-                let use_rp1 = opcode & 1 == 0;
+                // SHC[0] (0x34) uses rp2/zp1, SHC[1] (0x35) uses rp1/zp0
+                let use_rp1 = opcode & 1 != 0;
                 self.op_shc(use_rp1)?;
             }
             0x36..=0x37 => {
                 // SHZ[a] - shift zone
-                let use_rp1 = opcode & 1 == 0;
+                // SHZ[0] (0x36) uses rp2/zp1, SHZ[1] (0x37) uses rp1/zp0
+                let use_rp1 = opcode & 1 != 0;
                 self.op_shz(use_rp1)?;
             }
             0x38 => {
@@ -687,8 +845,12 @@ impl Interpreter {
                 let val = self.pop()?;
                 let idx = self.pop()? as u32;
                 let i = idx as usize;
+                // Dynamically grow storage if needed (fonts may exceed maxp limits)
                 if i >= self.storage.len() {
-                    return Err(HintError::InvalidStorageIndex(idx));
+                    if i > 10_000 {
+                        return Err(HintError::InvalidStorageIndex(idx));
+                    }
+                    self.storage.resize(i + 1, 0);
                 }
                 self.storage[i] = val;
             }
@@ -696,8 +858,12 @@ impl Interpreter {
                 // RS - read storage
                 let idx = self.pop()? as u32;
                 let i = idx as usize;
+                // Dynamically grow storage if needed (reads default to 0)
                 if i >= self.storage.len() {
-                    return Err(HintError::InvalidStorageIndex(idx));
+                    if i > 10_000 {
+                        return Err(HintError::InvalidStorageIndex(idx));
+                    }
+                    self.storage.resize(i + 1, 0);
                 }
                 self.push(self.storage[i])?;
             }
@@ -866,16 +1032,16 @@ impl Interpreter {
                     return Err(HintError::DivideByZero);
                 }
                 let a = self.pop()?;
-                // F26Dot6 division: (a << 6) / b
-                let result = ((a as i64) << 6) / (b as i64);
+                // F26Dot6 division: a * 64 / b with FreeType-compatible rounding
+                let result = ft_muldiv(a as i64, 64, b as i64);
                 self.push(result as i32)?;
             }
             0x63 => {
                 // MUL
                 let b = self.pop()?;
                 let a = self.pop()?;
-                // F26Dot6 multiplication: (a * b) >> 6
-                let result = ((a as i64) * (b as i64)) >> 6;
+                // F26Dot6 multiplication: a * b / 64 with FreeType-compatible rounding
+                let result = ft_muldiv(a as i64, b as i64, 64);
                 self.push(result as i32)?;
             }
             0x64 => {
@@ -949,7 +1115,9 @@ impl Interpreter {
                 let cond = self.pop()?;
                 let offset = self.pop()?;
                 if cond != 0 {
-                    let new_ip = (*ip as i64) + (offset as i64) - 2;
+                    // offset is relative to the JROT opcode position (*ip - 1)
+                    let opcode_pos = *ip as i64 - 1;
+                    let new_ip = opcode_pos + offset as i64;
                     if new_ip < 0 || new_ip > bytecode.len() as i64 {
                         return Err(HintError::InvalidJump);
                     }
@@ -961,7 +1129,9 @@ impl Interpreter {
                 let cond = self.pop()?;
                 let offset = self.pop()?;
                 if cond == 0 {
-                    let new_ip = (*ip as i64) + (offset as i64) - 2;
+                    // offset is relative to the JROF opcode position (*ip - 1)
+                    let opcode_pos = *ip as i64 - 1;
+                    let new_ip = opcode_pos + offset as i64;
                     if new_ip < 0 || new_ip > bytecode.len() as i64 {
                         return Err(HintError::InvalidJump);
                     }
@@ -1048,12 +1218,13 @@ impl Interpreter {
                 if len < 3 {
                     return Err(HintError::StackUnderflow);
                 }
-                let a = self.stack[len - 1];
-                let b = self.stack[len - 2];
-                let c = self.stack[len - 3];
-                self.stack[len - 1] = b;
-                self.stack[len - 2] = c;
-                self.stack[len - 3] = a;
+                let a = self.stack[len - 1]; // top
+                let b = self.stack[len - 2]; // second
+                let c = self.stack[len - 3]; // third
+                // Move third to top: [a,b,c] → [c,a,b]
+                self.stack[len - 1] = c;
+                self.stack[len - 2] = a;
+                self.stack[len - 3] = b;
             }
             0x8B => {
                 // MAX
@@ -1072,7 +1243,7 @@ impl Interpreter {
                 self.gs.scan_type = self.pop()?;
             }
             0x8E => {
-                // INSTCTRL
+                // INSTCTRL - pops selector (s) then value (v)
                 let s = self.pop()? as u32;
                 let v = self.pop()? as u32;
                 if s >= 1 && s <= 3 {
@@ -1314,8 +1485,21 @@ impl Interpreter {
 
     /// Move a point along the freedom vector by a given F26Dot6 distance.
     fn move_point(&mut self, zone: usize, point: usize, distance: i32) {
+        // Debug tracing for specific points (set via debug_trace_points)
+        if self.debug_trace_points && zone == 1 {
+            let (fx, fy) = self.gs.freedom_vector;
+            let (px, py) = self.gs.projection_vector;
+            let cur = self.zones.get(zone).and_then(|z| z.current.get(point)).copied();
+            eprintln!("[move_point] zone={zone} pt={point} dist={distance} fv=({},{}) pv=({},{}) cur={:?}",
+                fx.to_bits(), fy.to_bits(), px.to_bits(), py.to_bits(), cur);
+        }
+
+        // Dynamically grow zone if needed, with cap to prevent OOM
         if point >= self.zones[zone].current.len() {
-            return;
+            if point > 10_000 {
+                return; // silently ignore bogus point indices
+            }
+            self.zones[zone].resize(point + 1);
         }
 
         let (fx, fy) = self.gs.freedom_vector;
@@ -1332,8 +1516,12 @@ impl Interpreter {
         }
 
         // displacement = distance * freedom_vector / (freedom_vector · projection_vector)
-        let dx = ((distance as i64 * fx.to_bits() as i64 + (dot >> 1)) / dot) as i32;
-        let dy = ((distance as i64 * fy.to_bits() as i64 + (dot >> 1)) / dot) as i32;
+        // Use FreeType-compatible signed division: convert to absolute values,
+        // round with positive bias, then re-apply sign. This prevents
+        // truncation-toward-zero errors that cause negative displacements
+        // to under-apply by 1 F26Dot6 unit.
+        let dx = ft_muldiv(distance as i64, fx.to_bits() as i64, dot) as i32;
+        let dy = ft_muldiv(distance as i64, fy.to_bits() as i64, dot) as i32;
 
         self.zones[zone].current[point].x += dx;
         self.zones[zone].current[point].y += dy;
@@ -1349,29 +1537,41 @@ impl Interpreter {
 
     // ── Point / zone access helpers ──────────────────────────────────
 
-    fn get_point(&self, zone: usize, index: u32) -> Result<Point, HintError> {
-        self.zones
-            .get(zone)
-            .and_then(|z| z.current.get(index as usize))
-            .copied()
-            .ok_or(HintError::InvalidPointIndex(index))
+    fn get_point(&mut self, zone: usize, index: u32) -> Result<Point, HintError> {
+        let z = self.zones.get_mut(zone).ok_or(HintError::InvalidPointIndex(index))?;
+        let i = index as usize;
+        // Dynamically grow zone if needed (twilight zone may exceed maxp limits)
+        // Cap at reasonable limit to prevent OOM from corrupted indices
+        if i >= z.current.len() {
+            if i > 10_000 {
+                return Err(HintError::InvalidPointIndex(index));
+            }
+            z.resize(i + 1);
+        }
+        Ok(z.current[i])
     }
 
-    fn get_original_point(&self, zone: usize, index: u32) -> Result<Point, HintError> {
-        self.zones
-            .get(zone)
-            .and_then(|z| z.original.get(index as usize))
-            .copied()
-            .ok_or(HintError::InvalidPointIndex(index))
+    fn get_original_point(&mut self, zone: usize, index: u32) -> Result<Point, HintError> {
+        let z = self.zones.get_mut(zone).ok_or(HintError::InvalidPointIndex(index))?;
+        let i = index as usize;
+        if i >= z.original.len() {
+            if i > 10_000 {
+                return Err(HintError::InvalidPointIndex(index));
+            }
+            z.resize(i + 1);
+        }
+        Ok(z.original[i])
     }
 
     // ── Vector-from-line instructions ────────────────────────────────
 
     fn op_spvtl(&mut self, perpendicular: bool) -> Result<(), HintError> {
-        let p2_idx = self.pop()? as u32;
-        let p1_idx = self.pop()? as u32;
-        let p1 = self.get_point(self.gs.zp1 as usize, p1_idx)?;
-        let p2 = self.get_point(self.gs.zp2 as usize, p2_idx)?;
+        // FreeType convention: top→p1 with zp2, lower→p2 with zp1
+        // Vector direction: zp1[p2] - zp2[p1] (matching FreeType's DO_SPVTL)
+        let p1_idx = self.pop()? as u32; // top of stack
+        let p2_idx = self.pop()? as u32; // second
+        let p2 = self.get_point(self.gs.zp1 as usize, p2_idx)?;
+        let p1 = self.get_point(self.gs.zp2 as usize, p1_idx)?;
         let v = self.compute_vector_from_line(p1, p2, perpendicular);
         self.gs.projection_vector = v;
         self.gs.dual_projection_vector = v;
@@ -1379,26 +1579,28 @@ impl Interpreter {
     }
 
     fn op_sfvtl(&mut self, perpendicular: bool) -> Result<(), HintError> {
-        let p2_idx = self.pop()? as u32;
+        // Same convention as SPVTL: top→p1/zp2, lower→p2/zp1
         let p1_idx = self.pop()? as u32;
-        let p1 = self.get_point(self.gs.zp1 as usize, p1_idx)?;
-        let p2 = self.get_point(self.gs.zp2 as usize, p2_idx)?;
+        let p2_idx = self.pop()? as u32;
+        let p2 = self.get_point(self.gs.zp1 as usize, p2_idx)?;
+        let p1 = self.get_point(self.gs.zp2 as usize, p1_idx)?;
         self.gs.freedom_vector = self.compute_vector_from_line(p1, p2, perpendicular);
         Ok(())
     }
 
     fn op_sdpvtl(&mut self, perpendicular: bool) -> Result<(), HintError> {
-        let p2_idx = self.pop()? as u32;
+        // Same convention as SPVTL: top→p1/zp2, lower→p2/zp1
         let p1_idx = self.pop()? as u32;
+        let p2_idx = self.pop()? as u32;
 
         // Use current points for projection vector
-        let p1 = self.get_point(self.gs.zp1 as usize, p1_idx)?;
-        let p2 = self.get_point(self.gs.zp2 as usize, p2_idx)?;
+        let p2 = self.get_point(self.gs.zp1 as usize, p2_idx)?;
+        let p1 = self.get_point(self.gs.zp2 as usize, p1_idx)?;
         self.gs.projection_vector = self.compute_vector_from_line(p1, p2, perpendicular);
 
         // Use original points for dual projection vector
-        let op1 = self.get_original_point(self.gs.zp1 as usize, p1_idx)?;
-        let op2 = self.get_original_point(self.gs.zp2 as usize, p2_idx)?;
+        let op2 = self.get_original_point(self.gs.zp1 as usize, p2_idx)?;
+        let op1 = self.get_original_point(self.gs.zp2 as usize, p1_idx)?;
         self.gs.dual_projection_vector = self.compute_vector_from_line(op1, op2, perpendicular);
 
         Ok(())
@@ -1435,8 +1637,15 @@ impl Interpreter {
 
         let distance = if round {
             let rounded = self.gs.round(F26Dot6::from_bits(cur_dist));
+            if self.debug_trace_points && zp0 == 1 {
+                eprintln!("[MDAP R] pt={p} cur_dist={cur_dist} rounded={} dist={}",
+                    rounded.to_bits(), rounded.to_bits() - cur_dist);
+            }
             rounded.to_bits() - cur_dist
         } else {
+            if self.debug_trace_points && zp0 == 1 {
+                eprintln!("[MDAP noR] pt={p} cur_dist={cur_dist}");
+            }
             0
         };
 
@@ -1674,7 +1883,7 @@ impl Interpreter {
 
         let half = dist / 2;
         self.move_point(zp1, p1 as usize, half);
-        self.move_point(zp0, p2 as usize, -(dist - half));
+        self.move_point(zp0, p2 as usize, -half);
         Ok(())
     }
 
@@ -1783,19 +1992,19 @@ impl Interpreter {
         for _ in 0..loop_count {
             let p = self.pop()? as u32;
             let i = p as usize;
-            if i < self.zones[zp2].current.len() {
-                // Move directly along freedom vector (no projection)
-                self.zones[zp2].current[i].x +=
-                    ((dist as i64 * fx.to_bits() as i64 + 0x2000) >> 14) as i32;
-                self.zones[zp2].current[i].y +=
-                    ((dist as i64 * fy.to_bits() as i64 + 0x2000) >> 14) as i32;
+            self.zones[zp2].ensure_capacity(i + 1);
+            // Move directly along freedom vector (no projection)
+            // Use ft_muldiv for correct signed rounding (FreeType's TT_MulFix14)
+            self.zones[zp2].current[i].x +=
+                ft_muldiv(dist as i64, fx.to_bits() as i64, 0x4000) as i32;
+            self.zones[zp2].current[i].y +=
+                ft_muldiv(dist as i64, fy.to_bits() as i64, 0x4000) as i32;
 
-                if fx.to_bits() != 0 {
-                    self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_X);
-                }
-                if fy.to_bits() != 0 {
-                    self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_Y);
-                }
+            if fx.to_bits() != 0 {
+                self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_X);
+            }
+            if fy.to_bits() != 0 {
+                self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_Y);
             }
         }
         Ok(())
@@ -1824,6 +2033,11 @@ impl Interpreter {
             y: rp2_cur.y - rp1_cur.y,
         });
 
+        if self.debug_trace_points {
+            eprintln!("[IP] rp1={} rp2={} rp1_orig={:?} rp2_orig={:?} rp1_cur={:?} rp2_cur={:?} orig_range={} cur_range={}",
+                self.gs.rp1, self.gs.rp2, rp1_orig, rp2_orig, rp1_cur, rp2_cur, orig_range, cur_range);
+        }
+
         for _ in 0..loop_count {
             let p = self.pop()? as u32;
             let p_orig = self.get_original_point(zp2, p)?;
@@ -1835,9 +2049,7 @@ impl Interpreter {
             });
 
             let new_dist = if orig_range != 0 {
-                // Interpolate: new_dist = cur_range * orig_dist / orig_range
-                ((cur_range as i64 * orig_dist as i64 + (orig_range as i64 / 2))
-                    / orig_range as i64) as i32
+                ft_muldiv(cur_range as i64, orig_dist as i64, orig_range as i64) as i32
             } else {
                 orig_dist
             };
@@ -1846,6 +2058,11 @@ impl Interpreter {
                 x: p_cur.x - rp1_cur.x,
                 y: p_cur.y - rp1_cur.y,
             });
+
+            if self.debug_trace_points {
+                eprintln!("[IP]   pt={p} orig_dist={orig_dist} new_dist={new_dist} cur_dist={cur_dist} move={}",
+                    new_dist - cur_dist);
+            }
 
             self.move_point(zp2, p as usize, new_dist - cur_dist);
         }
@@ -1863,6 +2080,21 @@ impl Interpreter {
         } else {
             PointFlags::TOUCHED_Y
         };
+
+        if self.debug_trace_points {
+            let axis_name = if axis == 1 { "X" } else { "Y" };
+            eprintln!("[IUP {axis_name}] n_points={n_points}");
+            for i in 0..n_points.min(60) {
+                let f = self.zones[1].flags[i];
+                if f.contains(touched_flag) {
+                    let c = self.zones[1].current[i];
+                    let o = self.zones[1].original[i];
+                    let coord = if axis == 1 { c.x } else { c.y };
+                    let orig_coord = if axis == 1 { o.x } else { o.y };
+                    eprintln!("  touched[{i}] cur={coord} orig={orig_coord} delta={}", coord - orig_coord);
+                }
+            }
+        }
 
         // Collect all (contour_start, contour_end, touched_points) first
         // to avoid borrowing self.zones[1] while calling self.iup_interp.
@@ -1922,10 +2154,14 @@ impl Interpreter {
             if axis == 1 { p.x } else { p.y }
         };
 
-        let t1_orig = get_coord(&self.zones[1].original[t1_idx]);
+        // Use unscaled coordinates (orus) for interpolation factors — matches FreeType.
+        // Unscaled integers avoid F26Dot6 rounding errors in range/factor computation.
+        let t1_orus = get_coord(&self.zones[1].orus[t1_idx]);
         let t1_cur = get_coord(&self.zones[1].current[t1_idx]);
-        let t2_orig = get_coord(&self.zones[1].original[t2_idx]);
+        let t2_orus = get_coord(&self.zones[1].orus[t2_idx]);
         let t2_cur = get_coord(&self.zones[1].current[t2_idx]);
+        let t1_orig = get_coord(&self.zones[1].original[t1_idx]);
+        let t2_orig = get_coord(&self.zones[1].original[t2_idx]);
 
         let delta1 = t1_cur - t1_orig;
         let delta2 = t2_cur - t2_orig;
@@ -1952,35 +2188,39 @@ impl Interpreter {
                 continue;
             }
 
-            let orig = get_coord(&self.zones[1].original[i]);
+            // Use unscaled coordinates for interpolation (FreeType uses orus)
+            let orus_i = get_coord(&self.zones[1].orus[i]);
 
-            let new_coord = if t1_orig == t2_orig {
+            let new_coord = if t1_orus == t2_orus {
                 // Both reference points are at the same position: shift
                 let cur = get_coord(&self.zones[1].current[i]);
                 cur + delta1
             } else {
-                // Interpolate
-                let lo_orig = t1_orig.min(t2_orig);
-                let hi_orig = t1_orig.max(t2_orig);
-                let lo_cur = if t1_orig < t2_orig { t1_cur } else { t2_cur };
-                let hi_cur = if t1_orig < t2_orig { t2_cur } else { t1_cur };
-                let lo_delta = if t1_orig < t2_orig { delta1 } else { delta2 };
-                let hi_delta = if t1_orig < t2_orig { delta2 } else { delta1 };
+                // Interpolate using unscaled coordinates for range/factor
+                let lo_orus = t1_orus.min(t2_orus);
+                let hi_orus = t1_orus.max(t2_orus);
+                let lo_cur = if t1_orus < t2_orus { t1_cur } else { t2_cur };
+                let hi_cur = if t1_orus < t2_orus { t2_cur } else { t1_cur };
+                let lo_delta = if t1_orus < t2_orus { delta1 } else { delta2 };
+                let hi_delta = if t1_orus < t2_orus { delta2 } else { delta1 };
+                let _lo_orig = get_coord(&self.zones[1].original[if t1_orus < t2_orus { t1_idx } else { t2_idx }]);
 
-                if orig <= lo_orig {
+                if orus_i <= lo_orus {
                     // Below lower bound: shift by lower delta
+                    let orig = get_coord(&self.zones[1].original[i]);
                     orig + lo_delta
-                } else if orig >= hi_orig {
+                } else if orus_i >= hi_orus {
                     // Above upper bound: shift by upper delta
+                    let orig = get_coord(&self.zones[1].original[i]);
                     orig + hi_delta
                 } else {
-                    // Between: linear interpolation
-                    let range = hi_orig - lo_orig;
-                    let factor = orig - lo_orig;
-                    lo_cur
-                        + ((factor as i64 * (hi_cur - lo_cur) as i64
-                            + (range as i64 / 2))
-                            / range as i64) as i32
+                    // Between: linear interpolation using FreeType's approach
+                    // scale = FT_DivFix(cur2 - cur1, orus2 - orus1)
+                    // result = cur1 + FT_MulFix(orus_i - orus1, scale)
+                    let range = (hi_orus - lo_orus) as i64;
+                    let factor = (orus_i - lo_orus) as i64;
+                    let scale = ft_divfix((hi_cur - lo_cur) as i64, range);
+                    lo_cur + ft_mulfix(factor, scale) as i32
                 }
             };
 
@@ -2051,10 +2291,11 @@ impl Interpreter {
         let a0 = self.pop()? as u32;
         let p = self.pop()? as u32;
 
-        let pa0 = self.get_point(self.gs.zp1 as usize, a0)?;
-        let pa1 = self.get_point(self.gs.zp1 as usize, a1)?;
-        let pb0 = self.get_point(self.gs.zp0 as usize, b0)?;
-        let pb1 = self.get_point(self.gs.zp0 as usize, b1)?;
+        // Per TrueType spec: a0,a1 define line A using zp0; b0,b1 define line B using zp1
+        let pa0 = self.get_point(self.gs.zp0 as usize, a0)?;
+        let pa1 = self.get_point(self.gs.zp0 as usize, a1)?;
+        let pb0 = self.get_point(self.gs.zp1 as usize, b0)?;
+        let pb1 = self.get_point(self.gs.zp1 as usize, b1)?;
 
         // Line A: pa0 to pa1, Line B: pb0 to pb1
         let dax = (pa1.x - pa0.x) as i64;
@@ -2066,9 +2307,7 @@ impl Interpreter {
 
         let zp2 = self.gs.zp2 as usize;
         let i = p as usize;
-        if i >= self.zones[zp2].current.len() {
-            return Err(HintError::InvalidPointIndex(p));
-        }
+        self.zones[zp2].ensure_capacity(i + 1);
 
         if denom.abs() < 1 {
             // Lines are parallel; use midpoint of endpoints
@@ -2077,10 +2316,11 @@ impl Interpreter {
         } else {
             let dpx = (pb0.x - pa0.x) as i64;
             let dpy = (pb0.y - pa0.y) as i64;
-            let t = (dpx * dby - dpy * dbx) * 64 / denom;
+            let numer = dpx * dby - dpy * dbx;
+            let t = ft_muldiv(numer, 64, denom);
 
-            self.zones[zp2].current[i].x = pa0.x + ((dax * t + 32) >> 6) as i32;
-            self.zones[zp2].current[i].y = pa0.y + ((day * t + 32) >> 6) as i32;
+            self.zones[zp2].current[i].x = pa0.x + ft_muldiv(dax, t, 64) as i32;
+            self.zones[zp2].current[i].y = pa0.y + ft_muldiv(day, t, 64) as i32;
         }
 
         self.zones[zp2].flags[i].insert(PointFlags::TOUCHED_X | PointFlags::TOUCHED_Y);
@@ -2095,6 +2335,8 @@ impl Interpreter {
 
         for _ in 0..loop_count {
             let p = self.pop()? as usize;
+            // FLIPPT uses the glyph zone (zone 1), not zp0 - per TrueType spec
+            // "Flips a point to on-curve or off-curve" in the glyph outline zone
             if let Some(flags) = self.zones[1].flags.get_mut(p) {
                 flags.toggle(PointFlags::ON_CURVE);
             }
@@ -2132,8 +2374,10 @@ impl Interpreter {
             if target_ppem == self.ppem as i32 {
                 let magnitude = (arg & 0x0F) as i32;
                 let delta = if magnitude < 8 {
-                    -(magnitude + 1)
+                    // Spec: selector 0=-8, 1=-7, ..., 7=-1
+                    -(8 - magnitude)
                 } else {
+                    // Spec: selector 8=+1, 9=+2, ..., 15=+8
                     magnitude - 7
                 };
                 // Scale by 1 / (1 << delta_shift)
@@ -2170,8 +2414,10 @@ impl Interpreter {
             if target_ppem == self.ppem as i32 {
                 let magnitude = (arg & 0x0F) as i32;
                 let delta = if magnitude < 8 {
-                    -(magnitude + 1)
+                    // Spec: selector 0=-8, 1=-7, ..., 7=-1
+                    -(8 - magnitude)
                 } else {
+                    // Spec: selector 8=+1, 9=+2, ..., 15=+8
                     magnitude - 7
                 };
                 let scaled = if delta_shift > 0 {

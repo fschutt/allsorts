@@ -41,6 +41,7 @@ pub struct HintInstance {
     fpgm_executed: bool,
     prep_bytecode: Vec<u8>,
     cvt_funits: Vec<i16>,
+    current_ppem: Option<u16>,
 }
 
 impl HintInstance {
@@ -138,6 +139,7 @@ impl HintInstance {
             fpgm_executed,
             prep_bytecode,
             cvt_funits,
+            current_ppem: None,
         }))
     }
 
@@ -151,6 +153,11 @@ impl HintInstance {
 
     /// Prepare the interpreter for a specific ppem value.
     pub fn set_ppem(&mut self, ppem: u16, point_size: f64) -> Result<(), HintError> {
+        // Skip if already configured for this ppem
+        if self.current_ppem == Some(ppem) {
+            return Ok(());
+        }
+
         // Scale CVT from FUnits to F26Dot6
         self.interpreter.ppem = ppem;
         self.interpreter.scale =
@@ -165,43 +172,233 @@ impl HintInstance {
                 .execute_prep(&self.prep_bytecode, ppem, point_size);
         }
 
+        self.current_ppem = Some(ppem);
         Ok(())
     }
 
     /// Hint a simple glyph outline.
     ///
     /// Takes points already scaled to F26Dot6 pixel coordinates, the on-curve
-    /// flags, contour end indices, and the per-glyph instruction bytecode.
+    /// flags, contour end indices, the per-glyph instruction bytecode, and the
+    /// horizontal advance width in F26Dot6.
     ///
-    /// Returns the hinted point positions as (x, y) pairs in F26Dot6.
+    /// Internally appends 4 TrueType phantom points (origin, advance, top, bottom)
+    /// required by the bytecode interpreter, then strips them from the result.
+    ///
+    /// Returns the hinted outline point positions as (x, y) pairs in F26Dot6
+    /// (same length as `points_f26dot6`).
     pub fn hint_glyph(
         &mut self,
         points_f26dot6: &[(i32, i32)],
         on_curve: &[bool],
         contour_ends: &[u16],
         instructions: &[u8],
+        advance_width_f26dot6: i32,
+    ) -> Result<Vec<(i32, i32)>, HintError> {
+        self.hint_glyph_with_orus(points_f26dot6, None, on_curve, contour_ends, instructions, advance_width_f26dot6)
+    }
+
+    /// Hint a glyph with optional unscaled original coordinates.
+    ///
+    /// `raw_points_funits` provides the original font-unit coordinates (before scaling).
+    /// FreeType uses these for IUP interpolation factors, avoiding F26Dot6 rounding errors.
+    pub fn hint_glyph_with_orus(
+        &mut self,
+        points_f26dot6: &[(i32, i32)],
+        raw_points_funits: Option<&[(i16, i16)]>,
+        on_curve: &[bool],
+        contour_ends: &[u16],
+        instructions: &[u8],
+        advance_width_f26dot6: i32,
     ) -> Result<Vec<(i32, i32)>, HintError> {
         if instructions.is_empty() || !self.fpgm_executed {
-            // No instructions: return points unchanged
             return Ok(points_f26dot6.to_vec());
         }
 
-        let points: Vec<Point> = points_f26dot6
+        let real_count = points_f26dot6.len();
+
+        let mut points: Vec<Point> = points_f26dot6
             .iter()
             .map(|&(x, y)| Point { x, y })
             .collect();
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: advance_width_f26dot6, y: 0 });
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: 0, y: 0 });
 
-        self.interpreter
-            .hint_glyph(&points, on_curve, contour_ends, instructions)?;
+        let mut on_curve_ext: Vec<bool> = on_curve.to_vec();
+        on_curve_ext.extend_from_slice(&[true, true, true, true]);
 
-        // Extract hinted positions
+        // Build unscaled orus points if raw coordinates are provided
+        let orus: Option<Vec<Point>> = raw_points_funits.map(|raw| {
+            let mut orus_pts: Vec<Point> = raw
+                .iter()
+                .map(|&(x, y)| Point { x: x as i32, y: y as i32 })
+                .collect();
+            // Phantom points in font units
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts.push(Point { x: 0, y: 0 }); // advance in funits not needed for IUP
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts
+        });
+
+        self.interpreter.hint_glyph_with_orus(
+            &points,
+            orus.as_deref(),
+            &on_curve_ext,
+            contour_ends,
+            instructions,
+        )?;
+
         let result: Vec<(i32, i32)> = self.interpreter.zones[1]
             .current
             .iter()
-            .take(points.len())
+            .take(real_count)
             .map(|p| (p.x, p.y))
             .collect();
 
         Ok(result)
+    }
+
+    /// After a successful `hint_glyph_with_orus` call, returns per-point debug info:
+    /// `(current, original, orus, touched_x, touched_y)` for each real point.
+    pub fn zone_debug_info(&self, real_count: usize) -> Vec<((i32,i32),(i32,i32),(i32,i32),bool,bool)> {
+        let z = &self.interpreter.zones[1];
+        (0..real_count.min(z.current.len())).map(|i| {
+            let cur = (z.current[i].x, z.current[i].y);
+            let orig = (z.original[i].x, z.original[i].y);
+            let orus = (z.orus[i].x, z.orus[i].y);
+            let tx = z.flags[i].contains(interpreter::PointFlags::TOUCHED_X);
+            let ty = z.flags[i].contains(interpreter::PointFlags::TOUCHED_Y);
+            (cur, orig, orus, tx, ty)
+        }).collect()
+    }
+
+    /// Hint a glyph and return the hinted advance width in F26Dot6.
+    ///
+    /// This extracts the advance from the hinted phantom point (index n+1),
+    /// which is what FreeType uses for glyph positioning.
+    pub fn hinted_advance_f26dot6(
+        &mut self,
+        points_f26dot6: &[(i32, i32)],
+        raw_points_funits: Option<&[(i16, i16)]>,
+        on_curve: &[bool],
+        contour_ends: &[u16],
+        instructions: &[u8],
+        advance_width_f26dot6: i32,
+    ) -> Result<i32, HintError> {
+        if instructions.is_empty() || !self.fpgm_executed {
+            return Ok(advance_width_f26dot6);
+        }
+
+        let real_count = points_f26dot6.len();
+
+        let mut points: Vec<Point> = points_f26dot6
+            .iter()
+            .map(|&(x, y)| Point { x, y })
+            .collect();
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: advance_width_f26dot6, y: 0 });
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: 0, y: 0 });
+
+        let mut on_curve_ext: Vec<bool> = on_curve.to_vec();
+        on_curve_ext.extend_from_slice(&[true, true, true, true]);
+
+        let orus: Option<Vec<Point>> = raw_points_funits.map(|raw| {
+            let mut orus_pts: Vec<Point> = raw
+                .iter()
+                .map(|&(x, y)| Point { x: x as i32, y: y as i32 })
+                .collect();
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts.push(Point { x: 0, y: 0 });
+            orus_pts
+        });
+
+        self.interpreter.hint_glyph_with_orus(
+            &points,
+            orus.as_deref(),
+            &on_curve_ext,
+            contour_ends,
+            instructions,
+        )?;
+
+        // Phantom point at index real_count+1 is the hinted advance width
+        let hinted_advance = self.interpreter.zones[1]
+            .current
+            .get(real_count + 1)
+            .map(|p| p.x)
+            .unwrap_or(advance_width_f26dot6);
+
+        Ok(hinted_advance)
+    }
+
+    /// Hint a glyph and return both hinted coordinates AND post-hinting on-curve flags.
+    ///
+    /// FLIPPT/FLIPRGON/FLIPRGOFF instructions can change on-curve flags during hinting.
+    /// The path builder MUST use the returned flags, not the original raw_on_curve.
+    pub fn hint_glyph_with_flags(
+        &mut self,
+        points_f26dot6: &[(i32, i32)],
+        on_curve: &[bool],
+        contour_ends: &[u16],
+        instructions: &[u8],
+        advance_width_f26dot6: i32,
+    ) -> Result<(Vec<(i32, i32)>, Vec<bool>), HintError> {
+        if instructions.is_empty() || !self.fpgm_executed {
+            return Ok((points_f26dot6.to_vec(), on_curve.to_vec()));
+        }
+
+        let real_count = points_f26dot6.len();
+
+        let mut points: Vec<Point> = points_f26dot6
+            .iter()
+            .map(|&(x, y)| Point { x, y })
+            .collect();
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: advance_width_f26dot6, y: 0 });
+        points.push(Point { x: 0, y: 0 });
+        points.push(Point { x: 0, y: 0 });
+
+        let mut on_curve_ext: Vec<bool> = on_curve.to_vec();
+        on_curve_ext.extend_from_slice(&[true, true, true, true]);
+
+        self.interpreter
+            .hint_glyph(&points, &on_curve_ext, contour_ends, instructions)?;
+
+        let coords: Vec<(i32, i32)> = self.interpreter.zones[1]
+            .current
+            .iter()
+            .take(real_count)
+            .map(|p| (p.x, p.y))
+            .collect();
+
+        use interpreter::PointFlags;
+        let flags: Vec<bool> = self.interpreter.zones[1]
+            .flags
+            .iter()
+            .take(real_count)
+            .map(|f| f.contains(PointFlags::ON_CURVE))
+            .collect();
+
+        Ok((coords, flags))
+    }
+
+    /// Returns the prep bytecode.
+    pub fn prep_bytecode(&self) -> &[u8] {
+        &self.prep_bytecode
+    }
+
+    /// Returns the CVT values in font units (before scaling).
+    pub fn cvt_funits(&self) -> &[i16] {
+        &self.cvt_funits
+    }
+
+    /// Returns whether fpgm was executed successfully.
+    pub fn fpgm_executed(&self) -> bool {
+        self.fpgm_executed
     }
 }
