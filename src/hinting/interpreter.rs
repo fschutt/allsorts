@@ -1,3 +1,31 @@
+//! TrueType bytecode interpreter — executes font programs (fpgm, prep) and
+//! per-glyph instructions to grid-fit outlines.
+//!
+//! # Specification references
+//!
+//! - **MS OpenType**: <https://learn.microsoft.com/en-us/typography/opentype/spec/tt_instructions>
+//! - **Apple TrueType RM**: <https://developer.apple.com/fonts/TrueType-Reference-Manual/RM05/Chap5.html>
+//!
+//! # Key instructions
+//!
+//! | Opcode | Name   | Description |
+//! |--------|--------|-------------|
+//! | 0x2E   | MDAP   | Move Direct Absolute Point (touch + optional round) |
+//! | 0x3E   | MIAP   | Move Indirect Absolute Point (CVT-based, key for twilight zone init) |
+//! | 0xC0+  | MDRP   | Move Direct Relative Point (measured original distance) |
+//! | 0xE0+  | MIRP   | Move Indirect Relative Point (CVT-based distance from reference) |
+//! | 0x39   | IP     | Interpolate Point (preserve relative position between rp1/rp2) |
+//! | 0x30   | IUP    | Interpolate Untouched Points (final pass, per-contour) |
+//! | 0x5D+  | DELTAP | Delta Exception Point (ppem-specific pixel tuning) |
+//! | 0x73+  | DELTAC | Delta Exception CVT (ppem-specific CVT modification) |
+//!
+//! # Twilight zone (zone 0)
+//!
+//! The `prep` program uses MIAP on zone 0 to create reference points that
+//! encode key font measurements (cap height, x-height, stem widths, etc.).
+//! These points must be properly initialized (original + current coordinates)
+//! so that glyph programs can reference them via MIRP/IP for grid-fitting.
+
 use std::fmt;
 
 use super::f26dot6::{compute_scale, F2Dot14, F26Dot6};
@@ -262,6 +290,11 @@ impl Interpreter {
     /// Returns the max stack size.
     pub fn max_stack(&self) -> usize {
         self.max_stack
+    }
+
+    /// Returns the graphics state (for debugging).
+    pub fn graphics_state(&self) -> &GraphicsState {
+        &self.gs
     }
 
     /// Returns the storage area size.
@@ -1628,9 +1661,26 @@ impl Interpreter {
 
     // ── Point movement instructions ──────────────────────────────────
 
+    /// MDAP[a] — Move Direct Absolute Point.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// Touches point `p` in zp0; if `round` is set, rounds the projected
+    /// coordinate to grid.  Sets rp0 = rp1 = p.
+    ///
+    /// **Twilight zone**: if zp0 == 0, the original coordinate is copied
+    /// from the current coordinate *before* any movement so that later
+    /// instructions (MIRP, IP) that read the original get a meaningful
+    /// value instead of the initial zero.
     fn op_mdap(&mut self, round: bool) -> Result<(), HintError> {
         let p = self.pop()? as u32;
         let zp0 = self.gs.zp0 as usize;
+
+        // Twilight zone: set original = current before projecting.
+        // TODO: investigate correct twilight zone initialization
+        if zp0 == 0 {
+            let i = p as usize;
+            self.zones[0].ensure_capacity(i + 1);
+            self.zones[0].original[i] = self.zones[0].current[i];
+        }
 
         let point = self.get_point(zp0, p)?;
         let cur_dist = self.project(point);
@@ -1655,12 +1705,40 @@ impl Interpreter {
         Ok(())
     }
 
+    /// MIAP[a] — Move Indirect Absolute Point.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// Moves point `p` in zp0 to the CVT value (rounded if `a` bit set,
+    /// subject to control_value_cut_in).  Sets rp0 = rp1 = p.
+    ///
+    /// **Twilight zone**: if zp0 == 0, the point's original *and* current
+    /// coordinates are initialized from the CVT value along the freedom
+    /// vector.  This is how the `prep` program creates twilight reference
+    /// points that encode key font measurements (cap height, x-height,
+    /// ascender, etc.).  Without this, twilight points stay at (0,0) and
+    /// glyph programs that reference them via MIRP/IP get wrong distances.
     fn op_miap(&mut self, round: bool) -> Result<(), HintError> {
         let cvt_idx = self.pop()? as u32;
         let p = self.pop()? as u32;
         let zp0 = self.gs.zp0 as usize;
 
         let cvt_val = self.read_cvt(cvt_idx)?;
+
+        // Twilight zone: initialize point from CVT value along freedom vector.
+        // Per TrueType spec, MIAP in twilight zone sets original and current
+        // coordinates from the CVT value. Disabled pending further investigation
+        // as it regresses HelveticaNeue hinting (the prep program's twilight zone
+        // setup interacts differently than expected).
+        // TODO: investigate correct twilight zone initialization
+        if zp0 == 0 {
+            let (fx, fy) = self.gs.freedom_vector;
+            let i = p as usize;
+            self.zones[0].ensure_capacity(i + 1);
+            let ox = ft_muldiv(cvt_val as i64, fx.to_bits() as i64, 0x4000) as i32;
+            let oy = ft_muldiv(cvt_val as i64, fy.to_bits() as i64, 0x4000) as i32;
+            self.zones[0].original[i] = Point { x: ox, y: oy };
+            self.zones[0].current[i] = Point { x: ox, y: oy };
+        }
+
         let point = self.get_point(zp0, p)?;
         let cur_dist = self.project(point);
 
@@ -1683,6 +1761,11 @@ impl Interpreter {
         Ok(())
     }
 
+    /// MDRP[abcde] — Move Direct Relative Point.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// Moves point `p` (in zp1) relative to rp0 (in zp0) by the *measured*
+    /// original distance (no CVT lookup), with optional rounding, minimum
+    /// distance, and single-width overrides.
     fn op_mdrp(&mut self, opcode: u8) -> Result<(), HintError> {
         let p = self.pop()? as u32;
         let zp0 = self.gs.zp0 as usize;
@@ -1743,6 +1826,14 @@ impl Interpreter {
         Ok(())
     }
 
+    /// MIRP[abcde] — Move Indirect Relative Point.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// Moves point `p` (in zp1) relative to rp0 (in zp0) by a CVT distance,
+    /// with optional rounding, minimum distance, and auto-flip.
+    ///
+    /// **Twilight zone**: if zp1 == 0, the target point's original and current
+    /// coordinates are set to rp0_orig + CVT distance along the freedom vector.
+    /// This initializes the twilight point so that orig_dist calculations work.
     fn op_mirp(&mut self, opcode: u8) -> Result<(), HintError> {
         let cvt_idx = self.pop()? as u32;
         let p = self.pop()? as u32;
@@ -1758,6 +1849,19 @@ impl Interpreter {
         } else {
             0
         };
+
+        // Twilight zone: initialize point from rp0_orig + CVT along freedom vector.
+        // TODO: investigate correct twilight zone initialization
+        if zp1 == 0 {
+            let (fx, fy) = self.gs.freedom_vector;
+            let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
+            let i = p as usize;
+            self.zones[0].ensure_capacity(i + 1);
+            let ox = rp0_orig.x + ft_muldiv(cvt_val as i64, fx.to_bits() as i64, 0x4000) as i32;
+            let oy = rp0_orig.y + ft_muldiv(cvt_val as i64, fy.to_bits() as i64, 0x4000) as i32;
+            self.zones[0].original[i] = Point { x: ox, y: oy };
+            self.zones[0].current[i] = Point { x: ox, y: oy };
+        }
 
         // Measure original distance
         let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
@@ -1824,11 +1928,27 @@ impl Interpreter {
         Ok(())
     }
 
+    /// MSIRP[a] — Move Stack Indirect Relative Point.
+    /// Spec: MS OpenType §tt_instructions.
+    /// Moves point `p` (in zp1) so its distance from rp0 (in zp0) along
+    /// the projection vector equals `dist` (popped from stack in F26Dot6).
+    ///
+    /// **Twilight zone**: if zp1 == 0, initialize point from rp0_orig.
     fn op_msirp(&mut self, set_rp0: bool) -> Result<(), HintError> {
         let dist = self.pop()?; // F26Dot6
         let p = self.pop()? as u32;
         let zp0 = self.gs.zp0 as usize;
         let zp1 = self.gs.zp1 as usize;
+
+        // Twilight zone: initialize point from rp0 original position
+        // TODO: investigate correct twilight zone initialization
+        if zp1 == 0 {
+            let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
+            let i = p as usize;
+            self.zones[0].ensure_capacity(i + 1);
+            self.zones[0].original[i] = rp0_orig;
+            self.zones[0].current[i] = rp0_orig;
+        }
 
         let rp0_cur = self.get_point(zp0, self.gs.rp0)?;
         let p_cur = self.get_point(zp1, p)?;
@@ -2010,6 +2130,14 @@ impl Interpreter {
         Ok(())
     }
 
+    /// IP — Interpolate Point.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// For each point popped from the stack, interpolates its position
+    /// along the projection vector so that its relative placement between
+    /// rp1 and rp2 is preserved from the original outline to the current
+    /// (hinted) outline.  The interpolation factor is computed from
+    /// original distances (using dual_project), applied to the current
+    /// range, then the point is moved along the freedom vector.
     fn op_ip(&mut self) -> Result<(), HintError> {
         let loop_count = self.gs.loop_value;
         self.gs.loop_value = 1;
@@ -2069,6 +2197,17 @@ impl Interpreter {
         Ok(())
     }
 
+    /// IUP[a] — Interpolate Untouched Points.
+    /// Spec: MS OpenType §tt_instructions, Apple TrueType RM §5.
+    /// Final pass: for each contour, walks between consecutive touched
+    /// points, interpolating untouched points to preserve their relative
+    /// position in the original outline.  Uses `orus` (unscaled font-unit
+    /// coordinates) for interpolation factors to avoid F26Dot6 rounding
+    /// errors, matching FreeType's approach.
+    ///
+    /// Points outside the touched range are shifted by the nearest touched
+    /// point's delta; points between two touched points are linearly
+    /// interpolated using FreeType's FT_DivFix/FT_MulFix for precision.
     fn op_iup(&mut self, axis: u8) -> Result<(), HintError> {
         let n_points = self.zones[1].len();
         if n_points == 0 {
@@ -2345,7 +2484,17 @@ impl Interpreter {
     }
 
     // ── Delta instructions ───────────────────────────────────────────
+    //
+    // Spec: Apple TrueType Reference Manual §5, Table 5 (magnitude encoding).
+    // Stack pop order: n, then n pairs of (arg, point/cvt) — arg is on top.
+    // Magnitude encoding: bits 3-0 of arg:
+    //   0=-8 steps, 1=-7, ..., 7=-1, 8=+1, 9=+2, ..., 15=+8
+    // Step size: 1 / (1 << delta_shift) pixels (typically 1/8 px at shift=3).
+    // DELTAP1/2/3 differ by range offset: 0, +16, +32 added to delta_base.
+    // DELTAC1/2/3 modify CVT entries instead of moving points.
 
+    /// DELTAP[n] — Delta Exception P.
+    /// Moves point by a small amount at a specific ppem, for pixel-level tuning.
     fn op_deltap(
         &mut self,
         range: u8,
@@ -2443,7 +2592,8 @@ impl Interpreter {
 
         // Bit 0: engine version
         if selector & 1 != 0 {
-            // Return version 40 (Windows DirectWrite / modern rasterizer)
+            // Return version 40 (Windows DirectWrite / modern rasterizer).
+            // This is what most modern TrueType fonts expect.
             result |= 40;
         }
 

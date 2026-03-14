@@ -42,11 +42,19 @@ impl F26Dot6 {
     /// Scale an FUnit value to F26Dot6 pixels.
     ///
     /// `scale` is ppem * 64 / units_per_em, pre-computed as a fixed-point multiplier.
+    /// Uses FreeType-compatible signed rounding (FT_MulFix): take absolute values,
+    /// round with positive bias, re-apply sign. This prevents the rounding asymmetry
+    /// of `(negative + 0x8000) >> 16` which rounds ties toward zero instead of
+    /// away from zero.
     #[inline]
     pub fn from_funits(funits: i32, scale: i64) -> Self {
-        // funits * ppem * 64 / units_per_em
-        // We use i64 to avoid overflow
-        F26Dot6(((funits as i64 * scale + 0x8000) >> 16) as i32)
+        let mut s: i64 = 1;
+        let mut a = funits as i64;
+        let mut b = scale;
+        if a < 0 { a = -a; s = -s; }
+        if b < 0 { b = -b; s = -s; }
+        let c = (a * b + 0x8000) >> 16;
+        F26Dot6((if s > 0 { c } else { -c }) as i32)
     }
 
     #[inline]
@@ -170,5 +178,7 @@ pub fn compute_scale(ppem: u16, units_per_em: u16) -> i64 {
     }
     // We want: funits * ppem * 64 / units_per_em
     // Precompute: ppem * 64 * 65536 / units_per_em (as 16.16 fixed point)
-    ((ppem as i64) << 22) / (units_per_em as i64)
+    // Add upem/2 for proper rounding, matching FreeType's FT_DivFix.
+    let upem = units_per_em as i64;
+    (((ppem as i64) << 22) + (upem >> 1)) / upem
 }
