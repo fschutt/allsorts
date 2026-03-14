@@ -1776,13 +1776,14 @@ impl Interpreter {
         let respect_min_dist = (opcode >> 3) & 1 != 0;
         let do_round = (opcode >> 2) & 1 != 0;
 
-        // Measure original distance between rp0 and point
+        // Measure original distance between rp0 and point (before any adjustments)
         let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
         let p_orig = self.get_original_point(zp1, p)?;
-        let mut dist = self.dual_project(Point {
+        let orig_dist = self.dual_project(Point {
             x: p_orig.x - rp0_orig.x,
             y: p_orig.y - rp0_orig.y,
         });
+        let mut dist = orig_dist;
 
         // Apply single width
         let swv = self.gs.single_width_value.to_bits();
@@ -1799,12 +1800,22 @@ impl Interpreter {
 
         if respect_min_dist {
             let min_dist = self.gs.minimum_distance.to_bits();
-            if dist >= 0 {
+            // Use orig_dist sign (measured distance before any adjustments)
+            // to determine direction when dist rounds to zero.
+            if dist >= 0 && orig_dist >= 0 {
                 if dist < min_dist {
                     dist = min_dist;
                 }
-            } else if dist > -min_dist {
+            } else if dist <= 0 && orig_dist < 0 {
+                if dist > -min_dist {
+                    dist = -min_dist;
+                }
+            } else if dist >= 0 && orig_dist < 0 {
+                // Rounding crossed zero: use original direction
                 dist = -min_dist;
+            } else {
+                // dist < 0 && orig_dist >= 0: rounding crossed zero other way
+                dist = min_dist;
             }
         }
 
@@ -1896,17 +1907,30 @@ impl Interpreter {
         }
 
         if do_round {
+            let before_round = dist;
             dist = self.gs.round(F26Dot6::from_bits(dist)).to_bits();
+            if self.debug_trace_points && zp1 == 1 {
+                eprintln!("[MIRP] pt={p} cvt_idx={cvt_idx} cvt_val={cvt_val} orig_dist={orig_dist} after_autoflip={} before_round={before_round} after_round={dist}",
+                    if self.gs.auto_flip && (orig_dist >= 0) != (cvt_val >= 0) { -cvt_val } else { cvt_val });
+            }
         }
 
         if respect_min_dist {
             let min_dist = self.gs.minimum_distance.to_bits();
-            if dist >= 0 {
+            let before_min = dist;
+            // Use orig_dist sign to determine direction when dist rounds to zero.
+            // Without this, rounding a small negative distance to 0 would apply
+            // +minimum_distance instead of -minimum_distance, pushing the point
+            // in the WRONG direction (e.g., right instead of left).
+            if orig_dist >= 0 {
                 if dist < min_dist {
                     dist = min_dist;
                 }
             } else if dist > -min_dist {
                 dist = -min_dist;
+            }
+            if self.debug_trace_points && zp1 == 1 && before_min != dist {
+                eprintln!("[MIRP] pt={p} min_dist applied: {before_min} -> {dist} (orig_dist={orig_dist})");
             }
         }
 
