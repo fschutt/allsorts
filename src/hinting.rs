@@ -250,17 +250,13 @@ impl HintInstance {
             .iter()
             .map(|&(x, y)| Point { x, y })
             .collect();
-        // Round phantom points to pixel grid before hinting.
-        // FreeType rounds pp1/pp2 to grid before running the glyph program
-        // (for both TARGET_MONO and DEFAULT modes).  Without this, the glyph
-        // program operates on fractional phantom positions, and since most
-        // programs don't explicitly touch phantom points, the advance width
-        // stays at the unrounded value — causing 1px advance errors.
-        let round_f26 = |v: i32| -> i32 { (v + 32) & !63 };
+        // Don't round phantom points — let the glyph program handle them.
+        // Rounding changes the MD measurements used by conditional logic,
+        // causing wrong code paths (e.g., ClearType SHPIX on phantom points).
         points.push(Point { x: 0, y: 0 });                            // phantom[0]: origin
-        points.push(Point { x: round_f26(advance_width_f26dot6), y: 0 }); // phantom[1]: advance
-        points.push(Point { x: 0, y: round_f26(top_y) });             // phantom[2]: top
-        points.push(Point { x: 0, y: round_f26(bottom_y) });          // phantom[3]: bottom
+        points.push(Point { x: advance_width_f26dot6, y: 0 });        // phantom[1]: advance
+        points.push(Point { x: 0, y: top_y });                        // phantom[2]: top
+        points.push(Point { x: 0, y: bottom_y });                     // phantom[3]: bottom
 
         let mut on_curve_ext: Vec<bool> = on_curve.to_vec();
         on_curve_ext.extend_from_slice(&[true, true, true, true]);
@@ -334,9 +330,8 @@ impl HintInstance {
             .iter()
             .map(|&(x, y)| Point { x, y })
             .collect();
-        let round_f26 = |v: i32| -> i32 { (v + 32) & !63 };
         points.push(Point { x: 0, y: 0 });
-        points.push(Point { x: round_f26(advance_width_f26dot6), y: 0 });
+        points.push(Point { x: advance_width_f26dot6, y: 0 });
         points.push(Point { x: 0, y: 0 });
         points.push(Point { x: 0, y: 0 });
 
@@ -368,7 +363,7 @@ impl HintInstance {
             .current
             .get(real_count + 1)
             .map(|p| p.x)
-            .unwrap_or(round_f26(advance_width_f26dot6));
+            .unwrap_or(advance_width_f26dot6);
 
         Ok(hinted_advance)
     }
@@ -395,9 +390,8 @@ impl HintInstance {
             .iter()
             .map(|&(x, y)| Point { x, y })
             .collect();
-        let round_f26 = |v: i32| -> i32 { (v + 32) & !63 };
         points.push(Point { x: 0, y: 0 });
-        points.push(Point { x: round_f26(advance_width_f26dot6), y: 0 });
+        points.push(Point { x: advance_width_f26dot6, y: 0 });
         points.push(Point { x: 0, y: 0 });
         points.push(Point { x: 0, y: 0 });
 

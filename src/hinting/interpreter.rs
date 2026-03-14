@@ -2620,7 +2620,7 @@ impl Interpreter {
         // Bit 3: font variations active
         // (not currently supported in our interpreter)
 
-        // Bit 5: grayscale rendering
+        // Bit 5: grayscale rendering — we DO grayscale AA
         if selector & (1 << 5) != 0 {
             result |= 1 << 12; // grayscale bit
         }
