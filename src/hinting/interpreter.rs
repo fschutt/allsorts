@@ -816,6 +816,9 @@ impl Interpreter {
             0x2B => {
                 // CALL
                 let fn_id = self.pop()? as u32;
+                if self.debug_trace_points {
+                    eprintln!("[CALL] fn={fn_id} stack_depth={} ip={}", self.stack.len(), *ip - 1);
+                }
                 if self.call_depth >= MAX_CALL_DEPTH {
                     return Err(HintError::CallStackOverflow);
                 }
