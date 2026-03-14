@@ -2611,7 +2611,6 @@ impl Interpreter {
         // Bit 0: engine version
         if selector & 1 != 0 {
             // Return version 40 (Windows DirectWrite / modern rasterizer).
-            // This is what most modern TrueType fonts expect.
             result |= 40;
         }
 
