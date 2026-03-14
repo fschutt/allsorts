@@ -2715,8 +2715,9 @@ impl Interpreter {
         };
 
         for _ in 0..n {
-            let arg = self.pop()? as u32;
+            // TEST: try reversed pop order (cvt_idx first, then arg)
             let cvt_idx = self.pop()? as u32;
+            let arg = self.pop()? as u32;
 
             let ppem_offset = ((arg >> 4) & 0x0F) as i32;
             let target_ppem = delta_base + range_offset + ppem_offset;
@@ -2743,14 +2744,7 @@ impl Interpreter {
                         eprintln!("[DELTAC{}] CVT[{i}]: orig={base} → {} (delta={scaled}, ppem={target_ppem})",
                             range, base + scaled);
                     }
-                    // Apply DELTAC to original scaled CVT value when available.
-                    // The prep may round CVT values via WCVTP before DELTACs fire,
-                    // but DELTACs adjust the raw scaled value.
-                    if i < self.cvt_original.len() {
-                        self.cvt[i] = self.cvt_original[i] + scaled;
-                    } else {
-                        self.cvt[i] += scaled;
-                    }
+                    self.cvt[i] += scaled;
                 }
             }
         }
