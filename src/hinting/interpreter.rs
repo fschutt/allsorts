@@ -217,6 +217,9 @@ pub struct Interpreter {
 
     // CVT (F26Dot6 values stored as i32)
     pub(crate) cvt: Vec<i32>,
+    // Original scaled CVT values (before prep/WCVTP modifications).
+    // DELTAC applies adjustments to these originals, not WCVTP-modified values.
+    pub(crate) cvt_original: Vec<i32>,
 
     // Storage area
     pub(crate) storage: Vec<i32>,
@@ -287,6 +290,7 @@ impl Interpreter {
             stack: Vec::with_capacity(max_stack_elements as usize),
             max_stack: max_stack_elements as usize,
             cvt: Vec::new(),
+            cvt_original: Vec::new(),
             storage: vec![0i32; max_storage as usize],
             fdefs: vec![None; max_function_defs as usize],
             idefs: vec![None; max_instruction_defs as usize],
@@ -397,6 +401,12 @@ impl Interpreter {
             self.cvt
                 .push(F26Dot6::from_funits(funit as i32, self.scale).to_bits());
         }
+        // Save original scaled CVT values. DELTAC applies adjustments
+        // to these originals, not to WCVTP-modified values. Without this,
+        // the prep's WCVTP rounds CVT[0] from 1422→1408, then DELTAC(-40)
+        // gives 1368 (rounds to 1344=21px). With originals, DELTAC(-40)
+        // applies to 1422 giving 1382 (rounds to 1408=22px, correct).
+        self.cvt_original = self.cvt.clone();
     }
 
     /// Hint a glyph outline by executing its bytecode instructions.
@@ -1126,7 +1136,11 @@ impl Interpreter {
             0x5D => self.op_deltap(1, bytecode, ip)?, // DELTAP1
             0x5E => {
                 // SDB - set delta base
-                self.gs.delta_base = self.pop()? as u16;
+                let new_base = self.pop()? as u16;
+                if self.debug_trace_points {
+                    eprintln!("[SDB] delta_base: {} → {}", self.gs.delta_base, new_base);
+                }
+                self.gs.delta_base = new_base;
             }
             0x5F => {
                 // SDS - set delta shift
@@ -2670,9 +2684,20 @@ impl Interpreter {
 
     fn op_deltac(&mut self, range: u8) -> Result<(), HintError> {
         let n = self.pop()? as u32;
+        // n is already popped. The stack now has n pairs of (arg, cvt_idx).
+        // DELTAC args are byte values (0-255). Values >255 indicate stack misalignment.
         if self.debug_trace_points && n > 0 {
-            eprintln!("[DELTAC{range}] n={n} pairs, stack top: {:?}",
-                &self.stack[self.stack.len().saturating_sub(6)..]);
+            let pair_count = n as usize;
+            let stack_len = self.stack.len();
+            if stack_len >= pair_count * 2 {
+                for pi in 0..pair_count {
+                    let arg = self.stack[stack_len - 1 - pi * 2];
+                    if arg > 255 || arg < 0 {
+                        let cvt = self.stack[stack_len - 2 - pi * 2];
+                        eprintln!("[DELTAC{range}] STACK MISALIGNMENT: pair {pi}: arg={arg} (>255!) cvt_idx={cvt} at ppem={}", self.ppem);
+                    }
+                }
+            }
         }
         let delta_base = self.gs.delta_base as i32;
         let delta_shift = self.gs.delta_shift as i32;
@@ -2709,10 +2734,22 @@ impl Interpreter {
                 let i = cvt_idx as usize;
                 if i < self.cvt.len() {
                     if self.debug_trace_points && i < 8 {
-                        eprintln!("[DELTAC{}] CVT[{i}]: {} → {} (delta={scaled}, ppem={target_ppem}, arg=0x{:02X}, delta_base={}, mag={})",
-                            range, self.cvt[i], self.cvt[i] + scaled, arg, delta_base, magnitude);
+                        let base = if i < self.cvt_original.len() { self.cvt_original[i] } else { self.cvt[i] };
+                        eprintln!("[DELTAC{}] CVT[{i}]: orig={base} → {} (delta={scaled}, ppem={target_ppem})",
+                            range, base + scaled);
                     }
-                    self.cvt[i] += scaled;
+                    // Apply DELTAC to the ORIGINAL scaled CVT value (from scale_cvt),
+                    // not the current value (which may have been modified by WCVTP).
+                    // The prep rounds CVT values via WCVTP for twilight zone operations,
+                    // but DELTACs are designed to adjust the raw scaled values.
+                    // Example: CVT[0] at ppem=32: raw=1422, WCVTP rounds to 1408,
+                    // DELTAC(-40) on 1422 gives 1382 → round=1408 ✓
+                    // DELTAC(-40) on 1408 gives 1368 → round=1344 ✗
+                    if i < self.cvt_original.len() {
+                        self.cvt[i] = self.cvt_original[i] + scaled;
+                    } else {
+                        self.cvt[i] += scaled;
+                    }
                 }
             }
         }
