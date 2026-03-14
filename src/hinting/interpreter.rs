@@ -938,7 +938,10 @@ impl Interpreter {
                     return Err(HintError::UnexpectedEndOfBytecode);
                 }
                 for i in 0..n {
-                    let hi = bytecode[*ip + i * 2] as i16;
+                    // Cast high byte to i8 for proper sign extension.
+                    // u8 0xFF → i8 -1 → i32 -1 → shifted: -256
+                    // Previously cast as i16 which gave 255 → 65280 (WRONG)
+                    let hi = bytecode[*ip + i * 2] as i8;
                     let lo = bytecode[*ip + i * 2 + 1] as u8;
                     let val = ((hi as i32) << 8) | (lo as i32);
                     self.push(val)?;
@@ -1001,8 +1004,10 @@ impl Interpreter {
                 self.op_scfs()?;
             }
             0x49..=0x4A => {
-                // MD[a] - measure distance (0=current, 1=original)
-                let use_original = opcode & 1 != 0;
+                // MD[a] - measure distance
+                // 0x49 = MD[0]: use current (grid-fitted) positions
+                // 0x4A = MD[1]: use original (unhinted) positions
+                let use_original = opcode == 0x4A;
                 self.op_md(use_original)?;
             }
             0x4B => {
