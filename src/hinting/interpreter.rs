@@ -1838,6 +1838,10 @@ impl Interpreter {
                 cur_dist
             };
             let rounded = self.gs.round(F26Dot6::from_bits(target));
+            if self.debug_trace_points && zp0 == 1 {
+                eprintln!("[MIAP R] pt={p} cvt_idx={cvt_idx} cvt_val={cvt_val} cur={cur_dist} diff={diff} cut_in={} target={target} rounded={}",
+                    self.gs.control_value_cut_in.to_bits(), rounded.to_bits());
+            }
             rounded.to_bits() - cur_dist
         } else {
             cvt_val - cur_dist
