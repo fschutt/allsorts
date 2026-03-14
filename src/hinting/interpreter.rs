@@ -284,7 +284,7 @@ impl Interpreter {
             call_depth: 0,
             trace_mode: false,
             debug_trace_points: false,
-            subpixel_hinting: true, // default: Y-only hinting (matches Chrome/FreeType v40)
+            subpixel_hinting: true, // Y-only hinting (matches Chrome/FreeType v40)
             iup_y_snapshot: None,
         }
     }
