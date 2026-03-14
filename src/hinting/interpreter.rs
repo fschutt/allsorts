@@ -220,6 +220,9 @@ pub struct Interpreter {
     // Original scaled CVT values (before prep/WCVTP modifications).
     // DELTAC applies adjustments to these originals, not WCVTP-modified values.
     pub(crate) cvt_original: Vec<i32>,
+    // Accumulated DELTAC adjustments per CVT entry. Multiple DELTACs
+    // targeting the same CVT at the same ppem accumulate their deltas.
+    cvt_deltac_accum: Vec<i32>,
 
     // Storage area
     pub(crate) storage: Vec<i32>,
@@ -291,6 +294,7 @@ impl Interpreter {
             max_stack: max_stack_elements as usize,
             cvt: Vec::new(),
             cvt_original: Vec::new(),
+            cvt_deltac_accum: Vec::new(),
             storage: vec![0i32; max_storage as usize],
             fdefs: vec![None; max_function_defs as usize],
             idefs: vec![None; max_instruction_defs as usize],
@@ -407,6 +411,7 @@ impl Interpreter {
         // gives 1368 (rounds to 1344=21px). With originals, DELTAC(-40)
         // applies to 1422 giving 1382 (rounds to 1408=22px, correct).
         self.cvt_original = self.cvt.clone();
+        self.cvt_deltac_accum = vec![0i32; self.cvt.len()];
     }
 
     /// Hint a glyph outline by executing its bytecode instructions.
@@ -2738,13 +2743,9 @@ impl Interpreter {
                         eprintln!("[DELTAC{}] CVT[{i}]: orig={base} → {} (delta={scaled}, ppem={target_ppem})",
                             range, base + scaled);
                     }
-                    // Apply DELTAC to the ORIGINAL scaled CVT value (from scale_cvt),
-                    // not the current value (which may have been modified by WCVTP).
-                    // The prep rounds CVT values via WCVTP for twilight zone operations,
-                    // but DELTACs are designed to adjust the raw scaled values.
-                    // Example: CVT[0] at ppem=32: raw=1422, WCVTP rounds to 1408,
-                    // DELTAC(-40) on 1422 gives 1382 → round=1408 ✓
-                    // DELTAC(-40) on 1408 gives 1368 → round=1344 ✗
+                    // Apply DELTAC to original scaled CVT value when available.
+                    // The prep may round CVT values via WCVTP before DELTACs fire,
+                    // but DELTACs adjust the raw scaled value.
                     if i < self.cvt_original.len() {
                         self.cvt[i] = self.cvt_original[i] + scaled;
                     } else {
