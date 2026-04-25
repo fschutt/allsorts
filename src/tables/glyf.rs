@@ -15,7 +15,6 @@ use std::mem;
 use std::sync::Arc;
 
 use bitflags::bitflags;
-use itertools::Itertools;
 use log::warn;
 use pathfinder_geometry::transform2d::Matrix2x2F;
 use pathfinder_geometry::vector::Vector2F;
@@ -295,10 +294,14 @@ impl ReadBinaryDep for GlyfTable<'_> {
             return Err(ParseError::BadIndex);
         }
 
-        let glyph_records = loca
-            .offsets
-            .iter()
-            .tuple_windows()
+        let glyph_records = (0..loca.offsets.len() - 1)
+            .map(|i| {
+                // NOTE(unwrap): Bounded by `loca.offsets.len() - 1`, both
+                // indices are guaranteed in range.
+                let start = loca.offsets.get(i).unwrap();
+                let end = loca.offsets.get(i + 1).unwrap();
+                (start, end)
+            })
             .map(|(start, end)| match end.checked_sub(start) {
                 Some(0) => Ok(GlyfRecord::empty()),
                 Some(length) => {
