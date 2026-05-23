@@ -1,19 +1,19 @@
 [package]
 name = "allsorts-azul"
-version = "0.16.2"
+version = "0.16.3"
 authors = ["YesLogic Pty. Ltd. <info@yeslogic.com>", "Felix Schütt <felix.schuett@maps4print.com>"]
 edition = "2021"
 rust-version = "1.83"
 
-homepage = "https://github.com/fschutt/allsorts"
+homepage = "https://github.com/fschutt/allsorts-azul"
 documentation = "https://docs.rs/crate/allsorts-azul"
-repository = "https://github.com/fschutt/allsorts"
+repository = "https://github.com/fschutt/allsorts-azul"
 
 readme = "README.md"
 license = "Apache-2.0"
 include = ["/LICENSE", "src/**/*"]
 
-description = "Azul's fork of the allsorts font parser / shaping engine / subsetter. Adds pixel-snap hinting fixes + assorted bug fixes to YesLogic's upstream. Intended to be upstreamed — use the official `allsorts` crate if you can."
+description = "Azul's fork of the allsorts font parser / shaping engine / subsetter. Adds pixel-snap hinting fixes, slimmer direct dependencies (7 fewer than upstream), + assorted bug fixes to YesLogic's upstream. Intended to be upstreamed — use the official `allsorts` crate if you can."
 keywords = ["font", "shaping", "opentype", "truetype", "parse"]
 categories = ["text-processing"]
 
