@@ -1,3 +1,18 @@
+> **⚠️ This is `allsorts-azul` — a fork of [allsorts](https://github.com/yeslogic/allsorts) by [YesLogic](https://yeslogic.com/).**
+>
+> 🐛 **File issues and pull requests at
+> [github.com/fschutt/allsorts-azul](https://github.com/fschutt/allsorts-azul) —
+> NOT on the upstream YesLogic repo.** Reports sent upstream are about *this*
+> fork and only create confusion for the YesLogic maintainers.
+>
+> This fork adds pixel-snap TrueType hinting, slimmer direct dependencies
+> (7 fewer than upstream), and assorted bug fixes. All credit for the original
+> engine goes to YesLogic. Intended to be upstreamed — use the official
+> [`allsorts`](https://crates.io/crates/allsorts) crate if you can. For a
+> `no_std` build, see [`allsorts_no_std`](https://crates.io/crates/allsorts_no_std).
+
+---
+
 <h1 align="center">
   <img src="https://github.com/yeslogic/allsorts/raw/master/allsorts.svg?sanitize=1" alt=""><br>
   Allsorts
