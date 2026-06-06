@@ -69,6 +69,7 @@ pub trait FontTableProvider {
     ///
     /// Returns `None` if the tags cannot be determined.
     fn table_tags(&self) -> Option<Vec<u32>>;
+
 }
 
 pub trait SfntVersion {
@@ -410,25 +411,99 @@ impl ReadBinary for OffsetTable<'_> {
     }
 }
 
+// WEB-LIFT FIX (2026-06-02): plain big-endian reads from a byte slice. Used by the
+// manual table-directory scan below. The remill/web lift mis-handles the
+// `ReadArray<TableRecord>` read path (the nested-tuple `TableRecord` `read_dep` returns
+// `table_tag = 0` for EVERY record — proven via a probe: tags[7]=0x0000 while the bytes
+// at that offset are 0x68656164 'head' and `tag::HEAD`==0x6164), so the directory lookup
+// never matches and the font fails to parse → text measures height 0. These hand-rolled
+// indexed byte reads lift correctly.
+#[inline]
+fn be16(d: &[u8], o: usize) -> u32 {
+    ((d[o] as u32) << 8) | (d[o + 1] as u32)
+}
+#[inline]
+fn be32(d: &[u8], o: usize) -> u32 {
+    ((d[o] as u32) << 24) | ((d[o + 1] as u32) << 16) | ((d[o + 2] as u32) << 8) | (d[o + 3] as u32)
+}
+
+impl OffsetTableFontProvider<'_> {
+    /// Locate the table directory by hand for a single-font sfnt laid out at the start of
+    /// `self.scope` (TTF/OTTO/'true'): returns `(dir_offset, num_tables)`. Returns `None`
+    /// for TTC / unrecognised layouts so the caller falls back to the original
+    /// `ReadArray`-based path. See the `be32` comment for why this exists.
+    fn manual_dir(&self) -> Option<(usize, usize)> {
+        let data = self.scope.data();
+        if data.len() < 12 {
+            return None;
+        }
+        match be32(data, 0) {
+            // TTF_MAGIC | CFF_MAGIC (OTTO) | TRUE_MAGIC ('true')
+            0x0001_0000 | 0x4F54_544F | 0x7472_7565 => Some((12, be16(data, 4) as usize)),
+            _ => None,
+        }
+    }
+}
+
 impl FontTableProvider for OffsetTableFontProvider<'_> {
     fn table_data(&self, tag: u32) -> Result<Option<Cow<'_, [u8]>>, ParseError> {
+        if let Some((dir, num)) = self.manual_dir() {
+            let data = self.scope.data();
+            let mut i = 0;
+            while i < num {
+                let r = dir + i * 16;
+                if r + 16 > data.len() {
+                    break;
+                }
+                if be32(data, r) == tag {
+                    let off = be32(data, r + 8) as usize;
+                    let len = be32(data, r + 12) as usize;
+                    return Ok(off
+                        .checked_add(len)
+                        .filter(|&e| e <= data.len())
+                        .map(|e| Cow::Borrowed(&data[off..e])));
+                }
+                i += 1;
+            }
+            return Ok(None);
+        }
+        // Fallback (TTC / unrecognised): original ReadArray path.
         self.offset_table
             .read_table(&self.scope, tag)
             .map(|scope| scope.map(|scope| Cow::Borrowed(scope.data())))
     }
 
     fn has_table(&self, tag: u32) -> bool {
-        self.offset_table.find_table_record(tag).is_some()
+        self.table_data(tag).ok().flatten().is_some()
     }
 
     fn table_tags(&self) -> Option<Vec<u32>> {
-        Some(
-            self.offset_table
-                .table_records
-                .iter()
-                .map(|rec| rec.table_tag)
-                .collect(),
-        )
+        if let Some((dir, num)) = self.manual_dir() {
+            let data = self.scope.data();
+            let mut tags = Vec::with_capacity(num);
+            let mut i = 0;
+            while i < num {
+                let r = dir + i * 16;
+                if r + 4 > data.len() {
+                    break;
+                }
+                tags.push(be32(data, r));
+                i += 1;
+            }
+            return Some(tags);
+        }
+        // Fallback (TTC / unrecognised): original ReadArray path.
+        let records = &self.offset_table.table_records;
+        let n = records.len();
+        let mut tags = Vec::with_capacity(n);
+        let mut i = 0;
+        while i < n {
+            if let Ok(rec) = records.read_item(i) {
+                tags.push(rec.table_tag);
+            }
+            i += 1;
+        }
+        Some(tags)
     }
 }
 
@@ -465,9 +540,21 @@ impl WriteBinary<&Self> for TableRecord {
 
 impl<'a> OffsetTable<'a> {
     pub fn find_table_record(&self, tag: u32) -> Option<TableRecord> {
-        self.table_records
-            .iter()
-            .find(|table_record| table_record.table_tag == tag)
+        // Indexed loop instead of `.iter().find(closure)`: on the lifted/web backend the
+        // ReadArray iterator (ReadArrayIter::next) and/or the find-closure mis-lift and
+        // yield no match (same class as the css.rs map+collect element-drop). Indexed
+        // `read_item` lifts correctly (it's what binary_search uses).
+        let n = self.table_records.len();
+        let mut i = 0;
+        while i < n {
+            if let Ok(rec) = self.table_records.read_item(i) {
+                if rec.table_tag == tag {
+                    return Some(rec);
+                }
+            }
+            i += 1;
+        }
+        None
     }
 
     pub fn read_table(

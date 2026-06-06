@@ -6,7 +6,7 @@
 //!
 //! — <https://docs.microsoft.com/en-us/typography/opentype/spec/gsub>
 
-use std::collections::hash_map::Entry;
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 

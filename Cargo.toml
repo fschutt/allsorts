@@ -1,6 +1,6 @@
 [package]
 name = "allsorts-azul"
-version = "0.16.4"
+version = "0.16.5"
 authors = ["YesLogic Pty. Ltd. <info@yeslogic.com>", "Felix Schütt <felix.schuett@maps4print.com>"]
 edition = "2021"
 rust-version = "1.83"
