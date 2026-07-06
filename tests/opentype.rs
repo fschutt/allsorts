@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use allsorts::binary::read::ReadScope;
 use allsorts::error::ShapingError;
-use allsorts::gsub::{self, FeatureMask, Features};
+use allsorts::gsub::{self, FeatureMask, FeatureMaskExt};
 use allsorts::tables::cmap::CmapSubtable;
 use allsorts::tables::glyf::{
-    BoundingBox, GlyfRecord, GlyfTable, Glyph, Point, SimpleGlyph, SimpleGlyphFlag,
+    BoundingBox, GlyfRecord, GlyfTable, Glyph, Point, SimpleGlyph, SimpleGlyphFlags,
 };
 use allsorts::tables::loca::LocaTable;
 use allsorts::tables::{
@@ -106,9 +106,9 @@ fn test_decode_glyf() {
         end_pts_of_contours: vec![2],
         instructions: Box::default(),
         coordinates: vec![
-            (SimpleGlyphFlag::from_bits_truncate(1), Point(1761, 565)),
-            (SimpleGlyphFlag::from_bits_truncate(51), Point(2007, 565)),
-            (SimpleGlyphFlag::from_bits_truncate(3), Point(1884, 1032)),
+            (SimpleGlyphFlags::from_bits_truncate(1), Point(1761, 565)),
+            (SimpleGlyphFlags::from_bits_truncate(51), Point(2007, 565)),
+            (SimpleGlyphFlags::from_bits_truncate(3), Point(1884, 1032)),
         ],
         phantom_points: None,
     });
@@ -238,7 +238,8 @@ fn shape<'a, T: FontTableProvider>(
         gdef_table.as_ref().map(Arc::as_ref),
         script_tag,
         opt_lang_tag,
-        &Features::Mask(FeatureMask::default()),
+        FeatureMask::default_mask(),
+        &[],
         None,
         font.num_glyphs(),
         &mut glyphs,

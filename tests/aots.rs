@@ -7,7 +7,7 @@ use tinyvec::tiny_vec;
 use allsorts::binary::read::ReadScope;
 use allsorts::error::ShapingError;
 use allsorts::gpos::{self, Placement};
-use allsorts::gsub::{self, FeatureInfo, Features, GlyphOrigin, RawGlyph, RawGlyphFlags};
+use allsorts::gsub::{self, FeatureInfo, FeatureMask, GlyphOrigin, RawGlyph, RawGlyphFlags};
 use allsorts::layout::{new_layout_cache, GDEFTable, LayoutTable, GPOS, GSUB};
 use allsorts::tables::cmap::{Cmap, CmapSubtable, EncodingId, PlatformId};
 use allsorts::tables::kern::KernTable;
@@ -94,10 +94,10 @@ fn gsub_test(
     let script_tag = tag::from_string(script).unwrap();
     let opt_lang_tag = tag::from_string(language).ok();
     let feature_tag = tag::from_string(features).unwrap();
-    let features = Features::Custom(vec![FeatureInfo {
+    let custom_features = [FeatureInfo {
         feature_tag,
         alternate: None,
-    }]);
+    }];
 
     // Load font
     let font_buffer = read_fixture(Path::new("tests/aots").join(font));
@@ -119,7 +119,7 @@ fn gsub_test(
         ttf,
         script_tag,
         opt_lang_tag,
-        &features,
+        &custom_features,
         &mut glyphs,
     )
     .unwrap();
@@ -141,10 +141,10 @@ fn gpos_test(
 ) {
     let script_tag = tag::from_string(script).unwrap();
     let opt_lang_tag = tag::from_string(language).ok();
-    let features = Features::Custom(vec![FeatureInfo {
+    let custom_features = [FeatureInfo {
         feature_tag: tag::from_string(features).unwrap(),
         alternate: None,
-    }]);
+    }];
 
     // Load font
     let font_buffer = read_fixture(Path::new("tests/aots").join(font));
@@ -205,7 +205,7 @@ fn gpos_test(
             ttf,
             script_tag,
             opt_lang_tag,
-            &features,
+            &custom_features,
             &mut glyphs,
         )
         .unwrap();
@@ -224,22 +224,18 @@ fn gpos_test(
         .unwrap()
         .unwrap();
     let mut infos = gpos::Info::init_from_glyphs(opt_gdef_table.as_ref(), glyphs);
-    if let Features::Custom(features) = features {
-        gpos::apply_features(
-            &cache,
-            &cache.layout_table,
-            opt_gdef_table.as_ref(),
-            kern,
-            langsys,
-            features.iter().copied(),
-            None,
-            script_tag,
-            &mut infos,
-        )
-        .unwrap();
-    } else {
-        unreachable!()
-    }
+    gpos::apply_features(
+        &cache,
+        &cache.layout_table,
+        opt_gdef_table.as_ref(),
+        kern,
+        langsys,
+        custom_features.iter().copied(),
+        None,
+        script_tag,
+        &mut infos,
+    )
+    .unwrap();
 
     let pos = glyph_positions(&infos, &hmtx);
     let actual_x_deltas: Vec<i32> = pos
@@ -295,7 +291,7 @@ fn shape_ttf<'a>(
     ttf: OffsetTable<'a>,
     script_tag: u32,
     opt_lang_tag: Option<u32>,
-    features: &Features,
+    custom_features: &[FeatureInfo],
     glyphs: &mut Vec<RawGlyph<()>>,
 ) -> Result<(), ShapingError> {
     let gsub_record = ttf.find_table_record(tag::GSUB).unwrap();
@@ -318,7 +314,8 @@ fn shape_ttf<'a>(
         opt_gdef_table.as_ref(),
         script_tag,
         opt_lang_tag,
-        features,
+        FeatureMask::empty(),
+        custom_features,
         None,
         num_glyphs,
         glyphs,
