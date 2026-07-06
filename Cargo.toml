@@ -1,6 +1,14 @@
 [package]
 name = "allsorts-azul"
-version = "0.16.4"
+# Vendored fork (third_party/allsorts): adds LocaGlyf::load_shared / GlyfBytes
+# so the ~20 MB `glyf` table can be a zero-copy view into already-resident
+# (mmap'd) font bytes instead of a per-font heap copy. See
+# scripts/RELEASE_SIZE_MEMORY_AUDIT_2026_07_04.md §3.3a. Version stays 0.16.5
+# so [patch.crates-io] REPLACES the crates.io crate in place — a bumped version
+# resolves as a SECOND copy, leaving dependents on the un-patched old one.
+# Upstream to fschutt/allsorts-azul + publish 0.16.6, then drop the [patch]
+# (same workflow as rust-fontconfig / printpdf).
+version = "0.16.5"
 authors = ["YesLogic Pty. Ltd. <info@yeslogic.com>", "Felix Schütt <felix.schuett@maps4print.com>"]
 edition = "2021"
 rust-version = "1.83"
@@ -13,7 +21,7 @@ readme = "README.md"
 license = "Apache-2.0"
 include = ["/LICENSE", "/README.md", "src/**/*"]
 
-description = "Azul's fork of the allsorts font parser / shaping engine / subsetter. Adds pixel-snap hinting fixes, slimmer direct dependencies (7 fewer than upstream), + assorted bug fixes to YesLogic's upstream. Intended to be upstreamed — use the official `allsorts` crate if you can."
+description = "Azul's fork of the allsorts font parser / shaping engine / subsetter. Adds pixel-snap hinting fixes, slimmer direct dependencies (7 fewer than upstream), zero-copy shared `glyf` storage, + assorted bug fixes to YesLogic's upstream. Intended to be upstreamed — use the official `allsorts` crate if you can."
 keywords = ["font", "shaping", "opentype", "truetype", "parse"]
 categories = ["text-processing"]
 

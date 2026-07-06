@@ -13,8 +13,12 @@ use crate::{size, SafeFrom};
 use std::borrow::Cow;
 use std::cmp;
 use std::cmp::Ordering;
-use std::collections::hash_map::Entry;
-use std::collections::HashMap;
+// [azul web-lift] BTreeMap not HashMap for ReadCache: this cache (coverages/classdefs etc.) starts
+// EMPTY (cap-0) and the FIRST insert during GSUB/GPOS shaping hits the lifted hashbrown EMPTY-INSERT
+// mis-lift (reserve_rehash-from-0) → the remill-lifted web backend HANGS in shape_text. BTreeMap has
+// no ctrl-group/empty-static → immune. Key is `usize` (Ord); entry API is identical.
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -60,7 +64,7 @@ pub struct ReadCtxt<'a> {
 }
 
 pub struct ReadCache<T> {
-    map: HashMap<usize, Arc<T>>,
+    map: BTreeMap<usize, Arc<T>>,
 }
 
 pub trait ReadBinary {
@@ -367,7 +371,7 @@ impl fmt::Debug for ReadScope<'_> {
 
 impl<T> ReadCache<T> {
     pub fn new() -> Self {
-        let map = HashMap::new();
+        let map = BTreeMap::new();
         ReadCache { map }
     }
 }

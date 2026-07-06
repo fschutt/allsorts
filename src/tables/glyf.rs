@@ -138,10 +138,77 @@ pub struct LocaGlyf {
     loaded: bool,
     /// Data from `loca` table.
     loca: owned::LocaTable,
-    /// Raw `glyf` table data.
-    glyf: Box<[u8]>,
+    /// Raw `glyf` table data (owned copy, or a zero-copy view into shared
+    /// already-resident font bytes — see [`GlyfBytes`]).
+    glyf: GlyfBytes,
     /// Cache of parsed glyphs indexed by glyph ID.
     cache: FxHashMap<u16, Arc<Glyph>>,
+}
+
+/// Backing storage for the `glyf` table.
+///
+/// The classic path copies the whole `glyf` table onto the heap
+/// ([`GlyfBytes::Owned`]) — for a large font (e.g. a CJK or macOS system
+/// `.ttc`) that is a ~20-40 MB allocation kept for the font's lifetime, even
+/// though the source bytes are usually already resident (mmap'd) elsewhere.
+/// [`GlyfBytes::Shared`] instead keeps an `Arc` to those source bytes plus the
+/// `glyf` table's `(offset, len)`, so no copy is made. See
+/// [`LocaGlyf::load_shared`].
+pub enum GlyfBytes {
+    /// Owned heap copy of the `glyf` table.
+    Owned(Box<[u8]>),
+    /// Zero-copy view: `owner.as_ref()[offset..offset + len]` is the `glyf`
+    /// table. `owner` keeps the whole font buffer alive.
+    Shared {
+        /// The font buffer the `glyf` table lives inside; kept alive so the
+        /// view stays valid.
+        owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        /// Byte offset of the `glyf` table within `owner`.
+        offset: usize,
+        /// Length of the `glyf` table in bytes.
+        len: usize,
+    },
+}
+
+impl GlyfBytes {
+    /// The `glyf` table bytes.
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            GlyfBytes::Owned(b) => b,
+            GlyfBytes::Shared { owner, offset, len } => {
+                // Bounds were validated at construction (`load_shared`); clamp
+                // defensively so a bad range degrades to a short read (parse
+                // error) rather than a panic.
+                let all = (**owner).as_ref();
+                let end = offset.saturating_add(*len).min(all.len());
+                all.get(*offset..end).unwrap_or(&[])
+            }
+        }
+    }
+}
+
+impl From<Box<[u8]>> for GlyfBytes {
+    fn from(b: Box<[u8]>) -> Self {
+        GlyfBytes::Owned(b)
+    }
+}
+
+/// If `table` is a sub-slice that lives inside `owner`'s allocation, return its
+/// `(offset, len)` within `owner`; otherwise `None` (the provider returned an
+/// owned/relocated copy, so a zero-copy view is impossible). Uses address-range
+/// containment — valid because a `Cow::Borrowed` from a table provider points
+/// directly into the font buffer `owner` wraps.
+fn glyf_within(table: &[u8], owner: &[u8]) -> Option<(usize, usize)> {
+    let (base, obytes) = (owner.as_ptr() as usize, owner.len());
+    let (tstart, tlen) = (table.as_ptr() as usize, table.len());
+    let offset = tstart.checked_sub(base)?;
+    // Must lie fully within owner. (A zero-length table has no address to
+    // anchor and isn't worth sharing — fall back to Owned.)
+    if tlen == 0 || offset.checked_add(tlen)? > obytes {
+        return None;
+    }
+    Some((offset, tlen))
 }
 
 /// A record from the `glyf` table that maybe parsed
@@ -1037,7 +1104,7 @@ impl LocaGlyf {
         LocaGlyf {
             loaded: false,
             loca: owned::LocaTable::new(),
-            glyf: Box::default(),
+            glyf: GlyfBytes::Owned(Box::default()),
             cache: FxHashMap::default(),
         }
     }
@@ -1051,6 +1118,46 @@ impl LocaGlyf {
             .read_dep::<LocaTable<'_>>((maxp.num_glyphs, head.index_to_loc_format))?;
         let loca = owned::LocaTable::from(&loca);
         let glyf = read_and_box_table(provider, tag::GLYF)?;
+        Ok(LocaGlyf {
+            loaded: true,
+            loca,
+            glyf: GlyfBytes::Owned(glyf),
+            cache: FxHashMap::default(),
+        })
+    }
+
+    /// Load like [`load`][Self::load], but keep the `glyf` table as a
+    /// **zero-copy** view into `owner` instead of copying it onto the heap.
+    ///
+    /// `owner` must be the exact byte buffer the `provider` reads its tables
+    /// from (typically an `Arc` over the mmap'd/owned font file). The `glyf`
+    /// table is located within `owner` by matching the provider's borrowed
+    /// slice against `owner`'s address range; if the provider returns an
+    /// *owned* `glyf` (e.g. a WOFF-decompressed table) or the range can't be
+    /// validated, this transparently falls back to an owned copy — so the
+    /// result is always correct, only sometimes not zero-copy.
+    ///
+    /// Saves a per-font `glyf`-sized allocation (tens of MB for large CJK /
+    /// system fonts). See scripts/RELEASE_SIZE_MEMORY_AUDIT_2026_07_04.md §3.3a.
+    pub fn load_shared<F: FontTableProvider>(
+        provider: &F,
+        owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    ) -> Result<Self, ParseError> {
+        let head = ReadScope::new(&provider.read_table_data(tag::HEAD)?).read::<HeadTable>()?;
+        let maxp = ReadScope::new(&provider.read_table_data(tag::MAXP)?).read::<MaxpTable>()?;
+        let loca_data = provider.read_table_data(tag::LOCA)?;
+        let loca = ReadScope::new(&loca_data)
+            .read_dep::<LocaTable<'_>>((maxp.num_glyphs, head.index_to_loc_format))?;
+        let loca = owned::LocaTable::from(&loca);
+
+        let glyf_cow = provider.read_table_data(tag::GLYF)?;
+        let glyf = match glyf_within(&glyf_cow, (*owner).as_ref()) {
+            // The provider handed back a slice that lives inside `owner` — take
+            // a zero-copy view. `owner` keeps the buffer alive.
+            Some((offset, len)) => GlyfBytes::Shared { owner, offset, len },
+            // Owned/relocated table: fall back to a copy (still correct).
+            None => GlyfBytes::Owned(Box::from(glyf_cow.into_owned())),
+        };
         Ok(LocaGlyf {
             loaded: true,
             loca,
@@ -1068,7 +1175,7 @@ impl LocaGlyf {
         LocaGlyf {
             loaded: true,
             loca,
-            glyf,
+            glyf: GlyfBytes::Owned(glyf),
             cache: FxHashMap::default(),
         }
     }
@@ -1108,10 +1215,14 @@ impl LocaGlyf {
             .copied()
             .ok_or(ParseError::BadOffset)
             .map(usize::safe_from)?
-            .min(self.glyf.len());
+            .min(self.glyf.as_bytes().len());
 
         // Fetch the slice for the glyph
-        let glyph_data = self.glyf.get(start..end).ok_or(ParseError::BadOffset)?;
+        let glyph_data = self
+            .glyf
+            .as_bytes()
+            .get(start..end)
+            .ok_or(ParseError::BadOffset)?;
 
         // If the slice is empty, then this is a valid, but empty glyph
         let glyph = if glyph_data.is_empty() {

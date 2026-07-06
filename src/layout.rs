@@ -3,7 +3,7 @@
 pub mod morx;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -3528,10 +3528,13 @@ pub struct LayoutCacheData<T: LayoutTableType> {
 
     /// maps (script_tag, opt_lang_tag) to FeatureMask
     /// opt_lang_tag = None is represented as `DFLT`
-    pub supported_features: Mutex<HashMap<(u32, u32), u64>>,
+    // [azul web-lift] BTreeMap not HashMap: these caches start EMPTY (cap-0) and the FIRST insert at
+    // shape time triggers the lifted hashbrown EMPTY-INSERT mis-lift (reserve_rehash-from-0) → the
+    // web/remill backend HANGS in shape_text. BTreeMap has no ctrl-group/empty-static → immune.
+    pub supported_features: Mutex<BTreeMap<(u32, u32), u64>>,
 
     /// maps (script_tag, lang_tag, FeatureMask) to cached_lookups index
-    pub lookups_index: Mutex<HashMap<(u32, u32, u64), usize>>,
+    pub lookups_index: Mutex<BTreeMap<(u32, u32, u64), usize>>,
 
     pub cached_lookups: Mutex<Vec<Vec<(usize, u32)>>>,
 }
@@ -3540,8 +3543,8 @@ pub fn new_layout_cache<T: LayoutTableType>(layout_table: LayoutTable<T>) -> Lay
     let coverages = Mutex::new(ReadCache::new());
     let classdefs = Mutex::new(ReadCache::new());
     let lookup_cache = Mutex::new(Vec::new());
-    let supported_features = Mutex::new(HashMap::new());
-    let lookups_index = Mutex::new(HashMap::new());
+    let supported_features = Mutex::new(BTreeMap::new());
+    let lookups_index = Mutex::new(BTreeMap::new());
     let cached_lookups = Mutex::new(vec![Vec::new()]);
     Arc::new(LayoutCacheData {
         layout_table,
