@@ -455,3 +455,78 @@ fn cvt_index_out_of_bounds_returns_err_not_panic() {
     assert!(r.is_err(), "CVT index OOB must return Err, not panic");
 }
 
+
+// ── Twilight-zone original coordinates + MD direction ────────────────
+//
+// ttfautohint fonts store UNROUNDED edge positions in twilight ORIGINAL
+// coordinates (via MIAP) and read them back with GC[orig] to compute an
+// interpolation stretch factor:
+//   stretch = MD[0](before, after) / (GC[1](after) - GC[1](before))
+// For the two factors to agree in sign, MD must measure SECOND pop minus
+// FIRST pop, and nothing may clobber the twilight originals between the
+// MIAP and the GC[orig] reads (a prior MDAP implementation copied
+// current into original for twilight points, which turned the stretch
+// negative and displaced interpolated points by many pixels — Noto Sans
+// 'C' point 24 at 24 ppem landed 23 px below its true position).
+
+/// MIAP[1] in the twilight zone: original = unrounded CVT value, current =
+/// rounded (RTG) value.  CVT[0] is written from the program via WCVTP.
+///   cvt = 106 (1.656 px); RTG(106) = (106+32) & !63 = 128.
+#[test]
+fn miap_twilight_sets_unrounded_original_and_rounded_current() {
+    let mut itp = interp();
+    let program = [
+        0x00, // SVTCA[y]
+        0xB1, 0, 106, 0x44, // PUSHB_2 0 106 ; WCVTP  -> cvt[0] = 106
+        0xB0, 0, 0x13, // PUSHB_1 0 ; SZP0 -> zp0 = twilight
+        0xB1, 1, 0, 0x3F, // PUSHB_2 1 0 ; MIAP[1]  (point 1, cvt 0)
+    ];
+    run(&mut itp, &[(0, 0)], &program).unwrap();
+    assert_eq!(
+        itp.zones[0].original[1].y, 106,
+        "twilight original must keep the unrounded CVT value"
+    );
+    assert_eq!(
+        itp.zones[0].current[1].y, 128,
+        "twilight current must be the rounded CVT value"
+    );
+}
+
+/// MDAP must not modify ORIGINAL coordinates — not even in the twilight
+/// zone.  Per the MS spec it only touches / optionally rounds the CURRENT
+/// position and sets rp0 = rp1.
+#[test]
+fn mdap_must_not_clobber_twilight_originals() {
+    let mut itp = interp();
+    let program = [
+        0x00, // SVTCA[y]
+        0xB1, 0, 106, 0x44, // cvt[0] = 106
+        0xB0, 0, 0x13, // zp0 = twilight
+        0xB1, 1, 0, 0x3F, // MIAP[1] point 1  (org 106, cur 128)
+        0xB0, 1, 0x2E, // PUSHB_1 1 ; MDAP[0] on the same twilight point
+    ];
+    run(&mut itp, &[(0, 0)], &program).unwrap();
+    assert_eq!(
+        itp.zones[0].original[1].y, 106,
+        "MDAP[0] clobbered the twilight original (was the Noto garbling bug)"
+    );
+    assert_eq!(itp.zones[0].current[1].y, 128, "MDAP[0] must not move current");
+}
+
+/// MD[0] measures SECOND pop minus FIRST pop (de-facto semantics targeted
+/// by shipping bytecode; the MS prose reads backwards).  Observed via
+/// SHPIX: shift point 2 by MD(p0, p1) = y(p0) - y(p1) = 10 - 74 = -64.
+///   p2: 200 + (-64) = 136.  (A first-minus-second MD would give 264.)
+#[test]
+fn md_measures_second_pop_minus_first_pop() {
+    let mut itp = interp();
+    let program = [
+        0x00, // SVTCA[y]
+        0xB0, 2, // PUSHB_1 2      (SHPIX target)
+        0xB1, 0, 1, // PUSHB_2 0 1
+        0x49, // MD[0]  -> y(pt0) - y(pt1) = -64
+        0x38, // SHPIX  -> move pt2 by -64 along y
+    ];
+    run(&mut itp, &[(0, 10), (0, 74), (0, 200)], &program).unwrap();
+    assert_eq!(cur(&itp, 2), (0, 136), "MD direction must be second pop minus first pop");
+}

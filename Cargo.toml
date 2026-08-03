@@ -6,7 +6,7 @@ name = "allsorts-azul"
 # zero-copy view into already-resident (mmap'd) font bytes instead of a
 # per-font heap copy (see scripts/RELEASE_SIZE_MEMORY_AUDIT_2026_07_04.md
 # §3.3a); slimmer direct dependency set; and web-lift (remill) shaping fixes.
-version = "0.17.1"
+version = "0.17.2"
 authors = ["YesLogic Pty. Ltd. <info@yeslogic.com>", "Felix Schütt <felix.schuett@maps4print.com>"]
 edition = "2021"
 rust-version = "1.83"

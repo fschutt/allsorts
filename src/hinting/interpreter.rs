@@ -91,6 +91,32 @@ impl std::error::Error for HintError {}
 // values, add a half-divisor for rounding, divide, then reapply sign.
 
 #[inline]
+/// Dev-only: point index to trace (`AZ_HINT_TRACE_PT`), cached once.
+fn hint_trace_pt() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("AZ_HINT_TRACE_PT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+}
+
+/// Dev-only: twilight point index to trace (`AZ_HINT_TRACE_TW`), cached once.
+fn hint_trace_tw() -> Option<usize> {
+    static V: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("AZ_HINT_TRACE_TW")
+            .ok()
+            .and_then(|s| s.parse().ok())
+    })
+}
+
+/// Dev-only: dataflow op tracing (`AZ_HINT_TRACE_OPS=1`), cached once.
+fn hint_trace_ops() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("AZ_HINT_TRACE_OPS").is_ok_and(|s| s == "1"))
+}
+
 fn ft_muldiv(a: i64, b: i64, c: i64) -> i64 {
     if c == 0 {
         return 0;
@@ -553,6 +579,61 @@ impl Interpreter {
         bytecode: &[u8],
         ip: &mut usize,
     ) -> Result<(), HintError> {
+        // Debug tracing: AZ_HINT_TRACE_PT=<idx> watches one glyph-zone point,
+        // AZ_HINT_TRACE_TW=<idx> one twilight point; logs every instruction
+        // that moves it. Dev-only; zero cost when unset.
+        if hint_trace_pt().is_some() || hint_trace_tw().is_some() {
+            let watch = hint_trace_pt();
+            let tw = hint_trace_tw();
+            let before = watch.and_then(|w| {
+                self.zones.get(1).and_then(|z| z.current.get(w)).map(|p| (p.x, p.y))
+            });
+            let tw_before = tw.and_then(|w| {
+                self.zones.first().and_then(|z| {
+                    let c = z.current.get(w)?;
+                    let o = z.original.get(w)?;
+                    Some((c.x, c.y, o.x, o.y))
+                })
+            });
+            if opcode == 0x2A || opcode == 0x2B {
+                if let Some(&f) = self.stack.last() {
+                    eprintln!("TRACE call op={opcode:#04x} fn={f}");
+                }
+            }
+            let r = self.dispatch_inner(opcode, bytecode, ip);
+            if let (Some(w), Some((bx, by))) = (watch, before) {
+                if let Some(p) = self.zones.get(1).and_then(|z| z.current.get(w)) {
+                    if p.x != bx || p.y != by {
+                        eprintln!(
+                            "TRACE op={opcode:#04x} pt{w}: ({bx},{by}) -> ({},{})",
+                            p.x, p.y
+                        );
+                    }
+                }
+            }
+            if let (Some(w), Some((bx, by, box_, boy))) = (tw, tw_before) {
+                if let Some((c, o)) = self.zones.first().and_then(|z| {
+                    Some((z.current.get(w)?, z.original.get(w)?))
+                }) {
+                    if c.x != bx || c.y != by || o.x != box_ || o.y != boy {
+                        eprintln!(
+                            "TRACE op={opcode:#04x} tw{w}: cur({bx},{by})->({},{}) org({box_},{boy})->({},{})",
+                            c.x, c.y, o.x, o.y
+                        );
+                    }
+                }
+            }
+            return r;
+        }
+        self.dispatch_inner(opcode, bytecode, ip)
+    }
+
+    fn dispatch_inner(
+        &mut self,
+        opcode: u8,
+        bytecode: &[u8],
+        ip: &mut usize,
+    ) -> Result<(), HintError> {
         match opcode {
             // ── Vector setting ───────────────────────────────────
             0x00 => {
@@ -974,6 +1055,9 @@ impl Interpreter {
                     self.storage.resize(i + 1, 0);
                 }
                 self.storage[i] = val;
+                if hint_trace_ops() {
+                    eprintln!("TRACE ws [{i}] = {val}");
+                }
             }
             0x43 => {
                 // RS - read storage
@@ -985,6 +1069,9 @@ impl Interpreter {
                         return Err(HintError::InvalidStorageIndex(idx));
                     }
                     self.storage.resize(i + 1, 0);
+                }
+                if hint_trace_ops() {
+                    eprintln!("TRACE rs [{}] -> {}", i, self.storage[i]);
                 }
                 self.push(self.storage[i])?;
             }
@@ -1164,6 +1251,9 @@ impl Interpreter {
                 let a = self.pop()?;
                 // F26Dot6 division: a * 64 / b with FreeType-compatible rounding
                 let result = ft_muldiv(a as i64, 64, b as i64);
+                if hint_trace_ops() {
+                    eprintln!("TRACE div a={a} b={b} -> {result}");
+                }
                 self.push(result as i32)?;
             }
             0x63 => {
@@ -1172,6 +1262,9 @@ impl Interpreter {
                 let a = self.pop()?;
                 // F26Dot6 multiplication: a * b / 64 with FreeType-compatible rounding
                 let result = ft_muldiv(a as i64, b as i64, 64);
+                if hint_trace_ops() {
+                    eprintln!("TRACE mul a={a} b={b} -> {result}");
+                }
                 self.push(result as i32)?;
             }
             0x64 => {
@@ -1763,21 +1856,17 @@ impl Interpreter {
     /// Touches point `p` in zp0; if `round` is set, rounds the projected
     /// coordinate to grid.  Sets rp0 = rp1 = p.
     ///
-    /// **Twilight zone**: if zp0 == 0, the original coordinate is copied
-    /// from the current coordinate *before* any movement so that later
-    /// instructions (MIRP, IP) that read the original get a meaningful
-    /// value instead of the initial zero.
+    /// MDAP must NOT modify original coordinates in any zone. Twilight
+    /// originals are established by MIAP/MSIRP/MIRP/SCFS only. An earlier
+    /// version copied current into original here "so MIRP/IP get a
+    /// meaningful value"; that clobbered the unrounded edge positions
+    /// ttfautohint stores in twilight originals (its ip-between FDEF reads
+    /// them back via GC[orig] to compute an interpolation stretch factor),
+    /// which garbled interpolated points by many pixels (Noto Sans 'C'
+    /// pt24 at 24 ppem: -23 px).
     fn op_mdap(&mut self, round: bool) -> Result<(), HintError> {
         let p = self.pop()? as u32;
         let zp0 = self.gs.zp0 as usize;
-
-        // Twilight zone: set original = current before projecting.
-        // TODO: investigate correct twilight zone initialization
-        if zp0 == 0 {
-            let i = p as usize;
-            self.zones[0].ensure_capacity(i + 1);
-            self.zones[0].original[i] = self.zones[0].current[i];
-        }
 
         let point = self.get_point(zp0, p)?;
         let cur_dist = self.project(point);
@@ -1813,18 +1902,16 @@ impl Interpreter {
 
         let cvt_val = self.read_cvt(cvt_idx)?;
 
-        // Twilight zone: initialize point from CVT value along freedom vector.
-        // Per TrueType spec, MIAP in twilight zone sets original and current
-        // coordinates from the CVT value. Disabled pending further investigation
-        // as it regresses HelveticaNeue hinting (the prep program's twilight zone
-        // setup interacts differently than expected).
-        // TODO: investigate correct twilight zone initialization
+        // Twilight zone: per spec, MIAP in the twilight zone sets the point's
+        // original and current coordinates to the CVT value along the
+        // projection vector (the CVT value is a coordinate on the projection
+        // axis). The rounded/cut-in move below then adjusts only the current.
         if zp0 == 0 {
-            let (fx, fy) = self.gs.freedom_vector;
+            let (px, py) = self.gs.projection_vector;
             let i = p as usize;
             self.zones[0].ensure_capacity(i + 1);
-            let ox = ft_muldiv(cvt_val as i64, fx.to_bits() as i64, 0x4000) as i32;
-            let oy = ft_muldiv(cvt_val as i64, fy.to_bits() as i64, 0x4000) as i32;
+            let ox = ft_muldiv(cvt_val as i64, px.to_bits() as i64, 0x4000) as i32;
+            let oy = ft_muldiv(cvt_val as i64, py.to_bits() as i64, 0x4000) as i32;
             self.zones[0].original[i] = Point { x: ox, y: oy };
             self.zones[0].current[i] = Point { x: ox, y: oy };
         }
@@ -1943,15 +2030,16 @@ impl Interpreter {
             0
         };
 
-        // Twilight zone: initialize point from rp0_orig + CVT along freedom vector.
-        // TODO: investigate correct twilight zone initialization
+        // Twilight zone: per spec the point's original (and starting current)
+        // position is rp0's original position plus the CVT distance along the
+        // projection vector.
         if zp1 == 0 {
-            let (fx, fy) = self.gs.freedom_vector;
+            let (px, py) = self.gs.projection_vector;
             let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
             let i = p as usize;
             self.zones[0].ensure_capacity(i + 1);
-            let ox = rp0_orig.x + ft_muldiv(cvt_val as i64, fx.to_bits() as i64, 0x4000) as i32;
-            let oy = rp0_orig.y + ft_muldiv(cvt_val as i64, fy.to_bits() as i64, 0x4000) as i32;
+            let ox = rp0_orig.x + ft_muldiv(cvt_val as i64, px.to_bits() as i64, 0x4000) as i32;
+            let oy = rp0_orig.y + ft_muldiv(cvt_val as i64, py.to_bits() as i64, 0x4000) as i32;
             self.zones[0].original[i] = Point { x: ox, y: oy };
             self.zones[0].current[i] = Point { x: ox, y: oy };
         }
@@ -2037,14 +2125,18 @@ impl Interpreter {
         let zp0 = self.gs.zp0 as usize;
         let zp1 = self.gs.zp1 as usize;
 
-        // Twilight zone: initialize point from rp0 original position
-        // TODO: investigate correct twilight zone initialization
+        // Twilight zone: per spec the point's original position is set to
+        // rp0's original position plus `dist` along the projection vector;
+        // the current position starts there too before the regular move.
         if zp1 == 0 {
+            let (px, py) = self.gs.projection_vector;
             let rp0_orig = self.get_original_point(zp0, self.gs.rp0)?;
             let i = p as usize;
             self.zones[0].ensure_capacity(i + 1);
-            self.zones[0].original[i] = rp0_orig;
-            self.zones[0].current[i] = rp0_orig;
+            let ox = rp0_orig.x + ft_muldiv(dist as i64, px.to_bits() as i64, 0x4000) as i32;
+            let oy = rp0_orig.y + ft_muldiv(dist as i64, py.to_bits() as i64, 0x4000) as i32;
+            self.zones[0].original[i] = Point { x: ox, y: oy };
+            self.zones[0].current[i] = Point { x: ox, y: oy };
         }
 
         let rp0_cur = self.get_point(zp0, self.gs.rp0)?;
@@ -2080,6 +2172,12 @@ impl Interpreter {
                 x: p_cur.x - rp0_cur.x,
                 y: p_cur.y - rp0_cur.y,
             });
+            if hint_trace_pt().is_some() || hint_trace_tw().is_some() {
+                eprintln!(
+                    "TRACE alignrp p={p} loop={loop_count} rp0={rp0} zp0={zp0} zp1={zp1} rp0_cur=({},{}) p_cur=({},{}) cur_dist={cur_dist}",
+                    rp0_cur.x, rp0_cur.y, p_cur.x, p_cur.y,
+                );
+            }
             self.move_point(zp1, p as usize, -cur_dist);
         }
         Ok(())
@@ -2231,6 +2329,12 @@ impl Interpreter {
             let p = self.pop()? as u32;
             let i = p as usize;
             self.zones[zp2].ensure_capacity(i + 1);
+            if hint_trace_pt() == Some(i) {
+                eprintln!(
+                    "TRACE shpix p={p} dist={dist} zp2={zp2} free=({},{})",
+                    fx.to_bits(), fy.to_bits()
+                );
+            }
             // Move directly along freedom vector (no projection)
             // Use ft_muldiv for correct signed rounding (FreeType's TT_MulFix14)
             let dx = ft_muldiv(dist as i64, fx.to_bits() as i64, 0x4000) as i32;
@@ -2469,6 +2573,12 @@ impl Interpreter {
             self.get_point(zp2, p)?
         };
         let val = self.project(point);
+        if hint_trace_ops() {
+            eprintln!(
+                "TRACE gc p={p} zp2={zp2} orig={use_original} pt=({},{}) -> {val}",
+                point.x, point.y
+            );
+        }
         self.push(val)?;
         Ok(())
     }
@@ -2481,29 +2591,52 @@ impl Interpreter {
         let point = self.get_point(zp2, p)?;
         let cur = self.project(point);
         self.move_point(zp2, p as usize, val - cur);
+        // Twilight zone: per spec SCFS sets the original position too (the
+        // twilight zone has no outline; its originals are program-defined).
+        if zp2 == 0 {
+            let i = p as usize;
+            self.zones[0].ensure_capacity(i + 1);
+            self.zones[0].original[i] = self.zones[0].current[i];
+        }
         Ok(())
     }
 
+    /// MD[a] — Measure Distance.
+    ///
+    /// Pops p1 (zp1), then p2 (zp0); returns the projected distance
+    /// `coord(p2) - coord(p1)`, i.e. SECOND pop minus FIRST pop. The MS
+    /// spec prose reads as the opposite direction, but the de-facto
+    /// semantics targeted by real-world bytecode (ttfautohint fonts
+    /// compute an interpolation stretch factor as
+    /// `MD(cur) / (GC(orig) - GC(orig))` whose two factors must agree in
+    /// sign) require this direction. Verified A/B against FreeType output
+    /// for Noto Sans/Liberation/DejaVu glyph sweeps.
     fn op_md(&mut self, use_original: bool) -> Result<(), HintError> {
-        let p2 = self.pop()? as u32;
         let p1 = self.pop()? as u32;
+        let p2 = self.pop()? as u32;
 
         let dist = if use_original {
-            let p1_pt = self.get_original_point(self.gs.zp0 as usize, p1)?;
-            let p2_pt = self.get_original_point(self.gs.zp1 as usize, p2)?;
+            let p2_pt = self.get_original_point(self.gs.zp0 as usize, p2)?;
+            let p1_pt = self.get_original_point(self.gs.zp1 as usize, p1)?;
             self.dual_project(Point {
                 x: p2_pt.x - p1_pt.x,
                 y: p2_pt.y - p1_pt.y,
             })
         } else {
-            let p1_pt = self.get_point(self.gs.zp0 as usize, p1)?;
-            let p2_pt = self.get_point(self.gs.zp1 as usize, p2)?;
+            let p2_pt = self.get_point(self.gs.zp0 as usize, p2)?;
+            let p1_pt = self.get_point(self.gs.zp1 as usize, p1)?;
             self.project(Point {
                 x: p2_pt.x - p1_pt.x,
                 y: p2_pt.y - p1_pt.y,
             })
         };
 
+        if hint_trace_ops() {
+            eprintln!(
+                "TRACE md p1={p1} p2={p2} zp0={} zp1={} orig={use_original} -> {dist}",
+                self.gs.zp0, self.gs.zp1
+            );
+        }
         self.push(dist)?;
         Ok(())
     }
